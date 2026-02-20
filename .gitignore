@@ -16,6 +16,12 @@ discovery_output/*.log
 discovery_output/azure_*.html
 discovery_output/azure_*.json
 
+# Offline packages (downloaded via download_packages_offline.cmd)
+offline_packages/
+
+# Azure CLI installer (optional download)
+installers/
+
 # Logs
 *.log
 

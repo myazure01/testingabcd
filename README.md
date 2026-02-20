@@ -2,6 +2,10 @@
 
 Comprehensive Azure resource discovery tool for tenant-to-tenant migration planning.
 
+**✨ Fully Portable - Works Offline!**
+
+This tool includes bundled Python and supports offline package installation. Perfect for air-gapped or restricted environments.
+
 ## 🚀 Quick Start
 
 ### Option 1: Automated (Recommended)
@@ -10,7 +14,24 @@ Comprehensive Azure resource discovery tool for tenant-to-tenant migration plann
 run.cmd
 ```
 
-### Option 2: Manual Python Execution
+### Option 2: Offline/New System Deployment
+
+**For systems without internet or new deployments:**
+
+```bash
+# On internet-connected system (one-time):
+download_packages_offline.cmd
+
+# On target/offline system:
+setup_offline.cmd
+
+# Then run:
+run.cmd
+```
+
+See [OFFLINE_DEPLOYMENT.txt](OFFLINE_DEPLOYMENT.txt) for detailed guide.
+
+### Option 3: Manual Python Execution
 
 #### Using Bundled Python (No Installation Required)
 ```bash
@@ -64,7 +85,50 @@ python -m pip install -r requirements.txt
 .\tool\python\python.exe -m pip install openpyxl GitPython PyYAML requests
 ```
 
-## 📋 Prerequisites
+## � Offline/Air-Gapped Deployment
+
+**Deploy to systems without internet access:**
+
+### Step 1: Prepare Packages (On Internet-Connected System)
+
+```bash
+# Download all packages for offline installation
+download_packages_offline.cmd
+```
+
+This creates `offline_packages\` folder with all dependencies (~200-300 MB).
+
+### Step 2: Transfer to Target System
+
+Copy entire folder to target system via:
+- USB drive
+- Network share
+- ZIP file transfer
+
+### Step 3: Setup on Target System
+
+```bash
+# Install all packages from offline directory
+setup_offline.cmd
+```
+
+### Step 4: Run Discovery
+
+```bash
+# Works completely offline!
+run.cmd
+```
+
+**Benefits:**
+- ✅ No internet required on target system
+- ✅ All dependencies bundled
+- ✅ Reproducible across systems
+- ✅ Perfect for air-gapped environments
+- ✅ Complete Python 3.11 included
+
+**Complete Guide:** See [OFFLINE_DEPLOYMENT.txt](OFFLINE_DEPLOYMENT.txt)
+
+## �📋 Prerequisites
 
 1. **Azure CLI** (Required)
    - Download: https://aka.ms/installazurecliwindows
