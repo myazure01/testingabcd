@@ -1,21 +1,16 @@
 # Azure Discovery Tool - Git Ignore
 
-# Python
+# Python cache
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
-*.egg-info/
-dist/
-build/
 
 # Virtual environments
 venv/
 ENV/
 env/
 
-# Discovery output (keep sample files, exclude actual output)
+# Discovery output (keep sample files, exclude actual generated output)
 discovery_output/*.xlsx
 discovery_output/*.log
 discovery_output/azure_*.html
@@ -34,6 +29,3 @@ discovery_output/azure_*.json
 # OS
 .DS_Store
 Thumbs.db
-
-# Portable Python distribution (too large for git)
-tool/
