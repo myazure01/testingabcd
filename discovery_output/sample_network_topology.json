@@ -1,0 +1,219 @@
+{
+  "network_topology": {
+    "virtual_networks": [
+      {
+        "name": "vnet-prod-eastus",
+        "resource_group": "rg-network-prod-eastus",
+        "location": "eastus",
+        "address_space": ["10.0.0.0/16"],
+        "dns_servers": ["168.63.129.16"],
+        "subnets": [
+          {
+            "name": "snet-app",
+            "address_prefix": "10.0.1.0/24",
+            "service_endpoints": ["Microsoft.Storage", "Microsoft.Sql"],
+            "delegations": ["Microsoft.Web/serverFarms"],
+            "connected_resources": [
+              "app-customer-portal-prod",
+              "app-analytics-api-prod",
+              "app-inventory-api-prod"
+            ]
+          },
+          {
+            "name": "snet-data",
+            "address_prefix": "10.0.2.0/24",
+            "private_endpoints": [
+              {
+                "name": "pe-sql-prod",
+                "resource": "sql-prod-eastus",
+                "private_ip": "10.0.2.10"
+              },
+              {
+                "name": "pe-redis-prod",
+                "resource": "redis-prod-eastus",
+                "private_ip": "10.0.2.20"
+              }
+            ]
+          },
+          {
+            "name": "snet-aks",
+            "address_prefix": "10.0.10.0/22",
+            "delegations": ["Microsoft.ContainerService/managedClusters"],
+            "connected_resources": ["aks-prod-eastus"]
+          },
+          {
+            "name": "AzureBastionSubnet",
+            "address_prefix": "10.0.255.0/24",
+            "connected_resources": ["bastion-prod-eastus"]
+          }
+        ],
+        "peerings": [
+          {
+            "name": "peer-to-westus2",
+            "remote_vnet": "vnet-prod-westus2",
+            "allow_forwarded_traffic": true,
+            "allow_gateway_transit": false,
+            "use_remote_gateways": false
+          }
+        ],
+        "connected_resources_count": 45
+      },
+      {
+        "name": "vnet-prod-westus2",
+        "resource_group": "rg-network-prod-westus2",
+        "location": "westus2",
+        "address_space": ["10.1.0.0/16"],
+        "purpose": "Disaster Recovery",
+        "subnets": [
+          {
+            "name": "snet-dr",
+            "address_prefix": "10.1.1.0/24",
+            "connected_resources": ["sql-dr-westus2"]
+          }
+        ],
+        "peerings": [
+          {
+            "name": "peer-to-eastus",
+            "remote_vnet": "vnet-prod-eastus",
+            "allow_forwarded_traffic": true
+          }
+        ]
+      }
+    ],
+    "network_security_groups": [
+      {
+        "name": "nsg-app-prod",
+        "associated_subnets": ["vnet-prod-eastus/snet-app"],
+        "rules": [
+          {
+            "name": "AllowHTTPS",
+            "priority": 100,
+            "direction": "Inbound",
+            "access": "Allow",
+            "protocol": "Tcp",
+            "source": "*",
+            "destination": "*",
+            "source_port": "*",
+            "destination_port": "443"
+          },
+          {
+            "name": "AllowHTTP",
+            "priority": 110,
+            "direction": "Inbound",
+            "access": "Allow",
+            "protocol": "Tcp",
+            "source": "*",
+            "destination": "*",
+            "source_port": "*",
+            "destination_port": "80"
+          },
+          {
+            "name": "DenyAll",
+            "priority": 4096,
+            "direction": "Inbound",
+            "access": "Deny",
+            "protocol": "*",
+            "source": "*",
+            "destination": "*",
+            "source_port": "*",
+            "destination_port": "*"
+          }
+        ]
+      },
+      {
+        "name": "nsg-data-prod",
+        "associated_subnets": ["vnet-prod-eastus/snet-data"],
+        "rules": [
+          {
+            "name": "AllowSQLFromApp",
+            "priority": 100,
+            "direction": "Inbound",
+            "access": "Allow",
+            "protocol": "Tcp",
+            "source": "10.0.1.0/24",
+            "destination": "*",
+            "source_port": "*",
+            "destination_port": "1433"
+          },
+          {
+            "name": "AllowRedisFromApp",
+            "priority": 110,
+            "direction": "Inbound",
+            "access": "Allow",
+            "protocol": "Tcp",
+            "source": "10.0.1.0/24",
+            "destination": "*",
+            "source_port": "*",
+            "destination_port": "6380"
+          },
+          {
+            "name": "DenyAll",
+            "priority": 4096,
+            "direction": "Inbound",
+            "access": "Deny",
+            "protocol": "*",
+            "source": "*",
+            "destination": "*",
+            "source_port": "*",
+            "destination_port": "*"
+          }
+        ]
+      }
+    ],
+    "traffic_flows": [
+      {
+        "id": "flow-001",
+        "source": "Internet",
+        "destination": "app-customer-portal-prod",
+        "protocol": "HTTPS",
+        "port": 443,
+        "description": "Public web traffic"
+      },
+      {
+        "id": "flow-002",
+        "source": "app-customer-portal-prod",
+        "destination": "sql-prod-eastus",
+        "protocol": "TDS",
+        "port": 1433,
+        "via": "Private Endpoint (10.0.2.10)",
+        "description": "Database queries"
+      },
+      {
+        "id": "flow-003",
+        "source": "app-customer-portal-prod",
+        "destination": "redis-prod-eastus",
+        "protocol": "Redis",
+        "port": 6380,
+        "via": "Private Endpoint (10.0.2.20)",
+        "description": "Cache and session"
+      },
+      {
+        "id": "flow-004",
+        "source": "app-customer-portal-prod",
+        "destination": "stprodeastus001",
+        "protocol": "HTTPS",
+        "port": 443,
+        "via": "Service Endpoint",
+        "description": "Blob storage access"
+      }
+    ],
+    "public_endpoints": [
+      {
+        "resource": "app-customer-portal-prod",
+        "type": "App Service",
+        "url": "https://portal.customer.com",
+        "ip_type": "Dynamic",
+        "custom_domain": true,
+        "ssl_certificate": "portal.customer.com (Expires: 2027-03-15)"
+      },
+      {
+        "resource": "app-analytics-api-prod",
+        "type": "App Service",
+        "url": "https://api.analytics.internal.com",
+        "ip_type": "Dynamic",
+        "custom_domain": true,
+        "access_restriction": "Internal only"
+      }
+    ]
+  }
+}

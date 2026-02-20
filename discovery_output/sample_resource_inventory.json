@@ -1,0 +1,219 @@
+{
+  "discovery_metadata": {
+    "timestamp": "2026-02-20T10:30:45Z",
+    "tool_version": "1.0.0",
+    "scan_duration_seconds": 342,
+    "subscriptions_scanned": 2,
+    "total_resources": 156
+  },
+  "subscriptions": [
+    {
+      "subscription_id": "12345678-1234-1234-1234-123456789abc",
+      "subscription_name": "Production",
+      "state": "Enabled",
+      "resource_groups": [
+        {
+          "name": "rg-webapp-prod-eastus",
+          "location": "eastus",
+          "tags": {
+            "Environment": "Production",
+            "CostCenter": "Engineering",
+            "Application": "CustomerPortal"
+          },
+          "resources": [
+            {
+              "id": "/subscriptions/12345678-1234-1234-1234-123456789abc/resourceGroups/rg-webapp-prod-eastus/providers/Microsoft.Web/sites/app-customer-portal-prod",
+              "name": "app-customer-portal-prod",
+              "type": "Microsoft.Web/sites",
+              "location": "eastus",
+              "sku": {
+                "name": "P1v3",
+                "tier": "PremiumV3",
+                "capacity": 2
+              },
+              "properties": {
+                "state": "Running",
+                "runtime": ".NET 8.0",
+                "httpsOnly": true,
+                "ftpsState": "Disabled"
+              },
+              "dependencies": [
+                {
+                  "resource_id": "/subscriptions/12345678-1234-1234-1234-123456789abc/resourceGroups/rg-data-prod-eastus/providers/Microsoft.Sql/servers/sql-prod-eastus/databases/CustomerDB",
+                  "type": "SQL Database",
+                  "connection_type": "ADO.NET"
+                },
+                {
+                  "resource_id": "/subscriptions/12345678-1234-1234-1234-123456789abc/resourceGroups/rg-storage-prod/providers/Microsoft.Storage/storageAccounts/stprodeastus001",
+                  "type": "Storage Account",
+                  "connection_type": "Blob Storage"
+                },
+                {
+                  "resource_id": "/subscriptions/12345678-1234-1234-1234-123456789abc/resourceGroups/rg-cache-prod/providers/Microsoft.Cache/Redis/redis-prod-eastus",
+                  "type": "Redis Cache",
+                  "connection_type": "StackExchange.Redis"
+                }
+              ],
+              "app_settings": {
+                "ASPNETCORE_ENVIRONMENT": "Production",
+                "ApplicationInsights__ConnectionString": "***REDACTED***",
+                "Database__ConnectionString": "***REDACTED***",
+                "Redis__ConnectionString": "***REDACTED***"
+              },
+              "cost_estimate_monthly": 280.00
+            }
+          ]
+        },
+        {
+          "name": "rg-data-prod-eastus",
+          "location": "eastus",
+          "tags": {
+            "Environment": "Production",
+            "DataClassification": "Confidential"
+          },
+          "resources": [
+            {
+              "id": "/subscriptions/12345678-1234-1234-1234-123456789abc/resourceGroups/rg-data-prod-eastus/providers/Microsoft.Sql/servers/sql-prod-eastus",
+              "name": "sql-prod-eastus",
+              "type": "Microsoft.Sql/servers",
+              "location": "eastus",
+              "properties": {
+                "version": "12.0",
+                "administratorLogin": "sqladmin",
+                "publicNetworkAccess": "Disabled",
+                "minimalTlsVersion": "1.2"
+              },
+              "databases": [
+                {
+                  "name": "CustomerDB",
+                  "sku": "S3",
+                  "size_gb": 250,
+                  "backup_retention_days": 35,
+                  "geo_replication": true,
+                  "cost_estimate_monthly": 450.00
+                },
+                {
+                  "name": "AnalyticsDB",
+                  "sku": "P2",
+                  "size_gb": 500,
+                  "backup_retention_days": 35,
+                  "cost_estimate_monthly": 920.00
+                }
+              ],
+              "firewall_rules": [
+                {
+                  "name": "AllowAzureServices",
+                  "startIpAddress": "0.0.0.0",
+                  "endIpAddress": "0.0.0.0"
+                }
+              ],
+              "cost_estimate_monthly": 1370.00
+            }
+          ]
+        },
+        {
+          "name": "rg-storage-prod",
+          "location": "eastus",
+          "tags": {
+            "Environment": "Production"
+          },
+          "resources": [
+            {
+              "id": "/subscriptions/12345678-1234-1234-1234-123456789abc/resourceGroups/rg-storage-prod/providers/Microsoft.Storage/storageAccounts/stprodeastus001",
+              "name": "stprodeastus001",
+              "type": "Microsoft.Storage/storageAccounts",
+              "location": "eastus",
+              "sku": {
+                "name": "Standard_GRS",
+                "tier": "Standard"
+              },
+              "properties": {
+                "primaryLocation": "eastus",
+                "secondaryLocation": "westus2",
+                "supportsHttpsTrafficOnly": true,
+                "minimumTlsVersion": "TLS1_2",
+                "encryption": {
+                  "services": {
+                    "blob": "Enabled",
+                    "file": "Enabled"
+                  }
+                }
+              },
+              "containers": [
+                {
+                  "name": "documents",
+                  "size_gb": 145,
+                  "item_count": 45230
+                },
+                {
+                  "name": "images",
+                  "size_gb": 89,
+                  "item_count": 12450
+                },
+                {
+                  "name": "backups",
+                  "size_gb": 320,
+                  "item_count": 856
+                }
+              ],
+              "cost_estimate_monthly": 95.00
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "subscription_id": "87654321-4321-4321-4321-cba987654321",
+      "subscription_name": "Development",
+      "state": "Enabled",
+      "resource_groups": [
+        {
+          "name": "rg-webapp-dev-eastus",
+          "location": "eastus",
+          "tags": {
+            "Environment": "Development",
+            "Team": "Engineering"
+          },
+          "resources": [
+            {
+              "id": "/subscriptions/87654321-4321-4321-4321-cba987654321/resourceGroups/rg-webapp-dev-eastus/providers/Microsoft.Web/sites/app-customer-portal-dev",
+              "name": "app-customer-portal-dev",
+              "type": "Microsoft.Web/sites",
+              "location": "eastus",
+              "sku": {
+                "name": "B2",
+                "tier": "Basic"
+              },
+              "properties": {
+                "state": "Running",
+                "runtime": ".NET 8.0"
+              },
+              "cost_estimate_monthly": 55.00
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "resource_summary": {
+    "by_type": {
+      "Microsoft.Web/sites": 12,
+      "Microsoft.Sql/servers": 3,
+      "Microsoft.Storage/storageAccounts": 8,
+      "Microsoft.Cache/Redis": 4,
+      "Microsoft.Network/virtualNetworks": 6,
+      "Microsoft.Compute/virtualMachines": 15,
+      "Microsoft.KeyVault/vaults": 5,
+      "Microsoft.ContainerService/managedClusters": 2,
+      "Microsoft.ServiceBus/namespaces": 3,
+      "Microsoft.EventHub/namespaces": 2,
+      "Other": 96
+    },
+    "by_location": {
+      "eastus": 89,
+      "westus2": 45,
+      "centralus": 22
+    },
+    "total_estimated_monthly_cost": 15840.00
+  }
+}

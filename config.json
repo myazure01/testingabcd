@@ -1,0 +1,50 @@
+{
+    "_comment": "====== AZURE AUTHENTICATION ======",
+    "_auth_note": "Uses Azure CLI login (az login) - DefaultAzureCredential",
+    "auth_method": "default",
+    
+    "_subscription_comment": "Leave empty [] to scan all subscriptions, or specify: [\"sub-id-1\", \"sub-id-2\"]",
+    "subscription_ids": [],
+    
+    "_comment_devops": "====== AZURE DEVOPS GIT REPOSITORIES ======",
+    "_devops_instructions": [
+        "1. Go to Azure DevOps -> User Settings -> Personal Access Tokens",
+        "2. Create PAT with 'Code (Read)' permission",
+        "3. Format: https://PAT_NAME:PAT_TOKEN@dev.azure.com/ORG/PROJECT/_git/REPO",
+        "4. Repositories can be strings (uses default branch) or objects with branch selection"
+    ],
+    
+    "azure_devops": {
+        "organization": "YOUR_ORG_NAME",
+        "pat_token": "YOUR_PERSONAL_ACCESS_TOKEN",
+        "projects": [
+            {
+                "project_name": "PROJECT1",
+                "repositories": [
+                    {"name": "repo1", "branch": "main"},
+                    {"name": "repo2", "branch": "develop"}
+                ]
+            },
+            {
+                "project_name": "PROJECT2",
+                "repositories": [
+                    {"name": "webapp", "branch": "main"},
+                    {"name": "api", "branch": "release"}
+                ]
+            }
+        ]
+    },
+    
+    "_repo_format_note": "Repository format: string 'repo-name' OR object {name: 'repo-name', branch: 'branch-name'}. If branch not specified, uses default branch.",
+    
+    "_git_repos_manual": "Or manually specify full URLs (overrides azure_devops config)",
+    "git_repos": [],
+    
+    "_comment_options": "====== DISCOVERY OPTIONS ======",
+    "output_dir": "discovery_output",
+    "scan_code": true,
+    "scan_network_flows": true,
+    "deep_dependency_analysis": true,
+    "excluded_resource_groups": [],
+    "log_level": "INFO"
+}
