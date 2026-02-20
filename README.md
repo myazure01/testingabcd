@@ -77,6 +77,21 @@ python -m pip install -r requirements.txt
 
 ## 🔧 Configuration
 
+**Before running, verify your Python installation:**
+```bash
+# Using bundled Python
+.\tool\python\python.exe verify_python.py
+
+# Using system Python
+python verify_python.py
+```
+
+This will check:
+- Python version (3.8+ required)
+- Standard library modules (socket, ssl, etc.)
+- Azure SDK packages
+- Optional packages
+
 Edit `config.json` to customize:
 
 ```json
@@ -133,6 +148,15 @@ python --version
 
 ## 🔍 Troubleshooting
 
+### First Step: Run Verification Script
+```bash
+# This checks your Python installation
+.\tool\python\python.exe verify_python.py
+
+# OR with system Python
+python verify_python.py
+```
+
 ### Python Not Found
 ```bash
 # Use bundled Python
@@ -170,6 +194,38 @@ az account show
 
 # Check what's installed
 .\tool\python\python.exe -m pip show azure-identity
+```
+
+### "No module named socket" Error
+
+This error indicates the bundled Python installation is incomplete or corrupted.
+
+**Solution 1: Use System Python Instead**
+```bash
+# Install system Python from python.org
+# Then run:
+python -m pip install -r requirements.txt
+python azure_discovery.py
+```
+
+**Solution 2: Verify Bundled Python Installation**
+```bash
+# Check if standard library is accessible
+.\tool\python\python.exe -c "import sys; print(sys.path)"
+.\tool\python\python.exe -c "import socket; print('Socket OK')"
+```
+
+**Solution 3: Reinstall Bundled Python**
+- Delete the `tool\python\` folder
+- Download Python 3.11 portable/embedded version
+- Extract to `tool\python\`
+- Install pip and packages
+
+**Quick Fix: Skip Bundled Python**
+```bash
+# Just use system Python
+python -m pip install -r requirements.txt
+python azure_discovery.py
 ```
 
 ## 📁 Project Structure
