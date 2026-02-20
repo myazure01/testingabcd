@@ -7,8 +7,12 @@
 #   1. Azure CLI installed and logged in (run: az login)
 #   2. Python 3.11 installed (bundled version included in tool\python\)
 #
-# USAGE:
-#   .\run_discovery.ps1
+# USAGE OPTIONS:
+#   Option 1 (Recommended): Double-click run.cmd
+#   Option 2: powershell -ExecutionPolicy Bypass -File run_discovery.ps1
+#   Option 3: Right-click run_discovery.ps1 -> "Run with PowerShell"
+#
+# NOTE: This script is not digitally signed. Use run.cmd to bypass execution policy.
 #
 # OUTPUT:
 #   - HTML Reports (interactive web report)

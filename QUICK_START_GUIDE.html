@@ -205,11 +205,17 @@
         <div class="step">
             <span class="step-number">2</span>
             <strong style="font-size: 1.2em;">Run the Discovery Tool</strong>
-            <div class="code-block">.\run_discovery.ps1</div>
             <p style="margin-top: 10px; color: #666;">
-                <strong>OR</strong> if execution policy blocks it:
+                <strong>Option 1 (Recommended):</strong> Double-click the file
             </p>
-            <div class="code-block">powershell -ExecutionPolicy Bypass -File .\run_discovery.ps1</div>
+            <div class="code-block">run.cmd</div>
+            <p style="margin-top: 10px; color: #666;">
+                <strong>Option 2:</strong> Run from PowerShell
+            </p>
+            <div class="code-block">powershell -ExecutionPolicy Bypass -File run_discovery.ps1</div>
+            <p style="margin-top: 5px; color: #999; font-size: 0.9em;">
+                <em>Note: The script is not digitally signed. Use run.cmd to bypass execution policy.</em>
+            </p>
         </div>
 
         <div class="step">
