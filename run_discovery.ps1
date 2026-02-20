@@ -22,6 +22,32 @@
 # All reports will be saved in: discovery_output\
 #===================================================================================
 
+# Check execution policy
+$executionPolicy = Get-ExecutionPolicy -Scope CurrentUser
+if ($executionPolicy -eq "Restricted" -or $executionPolicy -eq "AllSigned") {
+    Write-Host ""
+    Write-Host "========================================================================" -ForegroundColor Red
+    Write-Host "  ⚠️  EXECUTION POLICY ERROR - SCRIPT CANNOT RUN" -ForegroundColor Yellow
+    Write-Host "========================================================================" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Windows is blocking this PowerShell script (not digitally signed)." -ForegroundColor White
+    Write-Host ""
+    Write-Host "✅ SOLUTION: Use this command instead:" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "   .\run.cmd" -ForegroundColor Cyan -BackgroundColor Black
+    Write-Host ""
+    Write-Host "OR from Command Prompt / File Explorer:" -ForegroundColor Yellow
+    Write-Host "   Double-click: run.cmd" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "OR run with bypass flag:" -ForegroundColor Yellow
+    Write-Host "   powershell -ExecutionPolicy Bypass -File .\run_discovery.ps1" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "========================================================================" -ForegroundColor Red
+    Write-Host ""
+    Read-Host "Press Enter to exit"
+    exit 1
+}
+
 Write-Host ""
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "  Azure Discovery Tool - Simple Runner  " -ForegroundColor Cyan
