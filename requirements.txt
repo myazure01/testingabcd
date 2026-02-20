@@ -1,6 +1,9 @@
 # Azure Discovery Tool - Python Dependencies
 # Install with: pip install -r requirements.txt
 
+# Python 2/3 compatibility
+six>=1.16.0
+
 # Core Azure SDK packages
 azure-identity>=1.15.0
 azure-mgmt-resource>=23.0.0

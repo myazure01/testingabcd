@@ -77,6 +77,7 @@ def check_optional_packages():
     print("-"*70)
     
     optional_packages = [
+        ('six', 'six (Python 2/3 compatibility)'),
         ('openpyxl', 'openpyxl (Excel support)'),
         ('git', 'GitPython (Git repo scanning)'),
         ('yaml', 'PyYAML (YAML parsing)'),
