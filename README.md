@@ -1,0 +1,234 @@
+# Azure Discovery Tool
+
+Comprehensive Azure resource discovery tool for tenant-to-tenant migration planning.
+
+## 🚀 Quick Start
+
+### Option 1: Automated (Recommended)
+```bash
+# Double-click or run:
+run.cmd
+```
+
+### Option 2: Manual Python Execution
+
+#### Using Bundled Python (No Installation Required)
+```bash
+# 1. Install dependencies
+.\tool\python\python.exe -m pip install -r requirements.txt
+
+# 2. Login to Azure
+az login
+
+# 3. Run the discovery script
+.\tool\python\python.exe azure_discovery.py
+```
+
+#### Using System Python
+```bash
+# 1. Install dependencies
+python -m pip install -r requirements.txt
+
+# 2. Login to Azure
+az login
+
+# 3. Run the discovery script
+python azure_discovery.py
+```
+
+## 📦 Package Installation
+
+### Install All Required Packages
+
+**With Bundled Python:**
+```bash
+.\tool\python\python.exe -m pip install --upgrade pip
+.\tool\python\python.exe -m pip install -r requirements.txt
+```
+
+**With System Python:**
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+### Install Individual Packages
+```bash
+# Core Azure SDK
+.\tool\python\python.exe -m pip install azure-identity azure-mgmt-resource
+
+# All Azure Management Libraries
+.\tool\python\python.exe -m pip install azure-mgmt-compute azure-mgmt-network azure-mgmt-storage
+
+# Additional Tools
+.\tool\python\python.exe -m pip install openpyxl GitPython PyYAML requests
+```
+
+## 📋 Prerequisites
+
+1. **Azure CLI** (Required)
+   - Download: https://aka.ms/installazurecliwindows
+   - Verify: `az --version`
+   - Login: `az login`
+
+2. **Python 3.11** (Optional - Bundled in `tool\python\`)
+   - Bundled version: `.\tool\python\python.exe --version`
+   - Or install from: https://www.python.org/downloads/
+
+## 🔧 Configuration
+
+Edit `config.json` to customize:
+
+```json
+{
+  "auth_method": "default",
+  "subscription_ids": [],
+  "scan_code": true,
+  "azure_devops": {
+    "organization": "YOUR_ORG",
+    "pat_token": "YOUR_TOKEN",
+    "projects": [...]
+  }
+}
+```
+
+## 📊 Output
+
+Reports are saved in `discovery_output\`:
+
+- **HTML Report**: Interactive web-based report with tabs
+- **Excel Report**: Detailed spreadsheet inventory
+- **JSON Data**: Raw discovery data for automation
+
+## 🛠️ Manual Commands Reference
+
+### Check Python Version
+```bash
+# Bundled Python
+.\tool\python\python.exe --version
+
+# System Python
+python --version
+```
+
+### Verify Package Installation
+```bash
+# Check if Azure SDK is installed
+.\tool\python\python.exe -c "import azure.identity; print('Azure SDK OK')"
+
+# List all installed packages
+.\tool\python\python.exe -m pip list
+```
+
+### Update All Packages
+```bash
+.\tool\python\python.exe -m pip install --upgrade -r requirements.txt
+```
+
+### Run with Specific Subscription
+```bash
+# Edit config.json first, then:
+.\tool\python\python.exe azure_discovery.py
+```
+
+## 🔍 Troubleshooting
+
+### Python Not Found
+```bash
+# Use bundled Python
+.\tool\python\python.exe azure_discovery.py
+
+# Or add to PATH and use:
+python azure_discovery.py
+```
+
+### Package Installation Fails
+```bash
+# Upgrade pip first
+.\tool\python\python.exe -m pip install --upgrade pip
+
+# Install with verbose output
+.\tool\python\python.exe -m pip install -r requirements.txt -v
+```
+
+### Azure Authentication Issues
+```bash
+# Clear cached credentials
+az account clear
+
+# Login again
+az login
+
+# Verify login
+az account show
+```
+
+### Import Errors
+```bash
+# Reinstall specific package
+.\tool\python\python.exe -m pip install --force-reinstall azure-identity
+
+# Check what's installed
+.\tool\python\python.exe -m pip show azure-identity
+```
+
+## 📁 Project Structure
+
+```
+Discovery/
+├── azure_discovery.py      # Main discovery script
+├── config.json             # Configuration file
+├── requirements.txt        # Python dependencies
+├── run.cmd                 # Windows launcher
+├── run_discovery.ps1       # PowerShell script
+├── START_HERE.txt          # Quick start guide
+├── QUICK_START_GUIDE.html  # HTML documentation
+├── tool\
+│   └── python\             # Bundled Python 3.11
+└── discovery_output\       # Generated reports
+```
+
+## 🔒 Security
+
+- **READ-ONLY**: This tool only reads Azure resources
+- **No Modifications**: Does NOT create, modify, or delete anything
+- **Minimum Permission**: Requires only "Reader" role
+- **Safe for Production**: Can run in live environments
+
+## 💡 Tips
+
+1. **First Time Setup:**
+   ```bash
+   az login
+   .\run.cmd
+   ```
+
+2. **Manual Control:**
+   ```bash
+   .\tool\python\python.exe -m pip install -r requirements.txt
+   .\tool\python\python.exe azure_discovery.py
+   ```
+
+3. **Custom Configuration:**
+   - Edit `config.json` before running
+   - Specify subscriptions, repos, and options
+
+4. **Offline Package Installation:**
+   ```bash
+   # Download packages
+   .\tool\python\python.exe -m pip download -r requirements.txt -d packages
+
+   # Install offline
+   .\tool\python\python.exe -m pip install --no-index --find-links=packages -r requirements.txt
+   ```
+
+## 📞 Support
+
+For issues or questions:
+1. Check `START_HERE.txt` for quick solutions
+2. Open `QUICK_START_GUIDE.html` in browser
+3. Review sample reports in `discovery_output\`
+
+## 📝 License
+
+See LICENSE.txt for details.
