@@ -61,6 +61,35 @@ $BUNDLED_PYTHON = ".\tool\python\python.exe"
 if (Test-Path $BUNDLED_PYTHON) {
     $PYTHON_CMD = $BUNDLED_PYTHON
     Write-Host "[OK] Using bundled Python" -ForegroundColor Green
+    
+    # Verify critical standard library modules
+    Write-Host "Verifying Python installation..." -ForegroundColor Gray
+    $socketTest = & $PYTHON_CMD -c "import socket" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ""
+        Write-Host "========================================================================" -ForegroundColor Red
+        Write-Host "  ERROR: Bundled Python is missing socket module!" -ForegroundColor Yellow
+        Write-Host "========================================================================" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "The bundled Python installation is incomplete or corrupted." -ForegroundColor White
+        Write-Host "The 'socket' module is part of Python's standard library." -ForegroundColor White
+        Write-Host ""
+        Write-Host "SOLUTIONS:" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "1. Use System Python (Recommended):" -ForegroundColor Green
+        Write-Host "   a. Install Python 3.11 from: https://www.python.org/downloads/" -ForegroundColor Gray
+        Write-Host "   b. Run: python -m pip install -r requirements.txt" -ForegroundColor Gray
+        Write-Host "   c. Run: python azure_discovery.py" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "2. Run Diagnostic:" -ForegroundColor Green
+        Write-Host "   python verify_python.py" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "========================================================================" -ForegroundColor Red
+        Write-Host ""
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
+    Write-Host "[OK] Python standard library verified" -ForegroundColor Green
 } elseif (Get-Command python -ErrorAction SilentlyContinue) {
     $PYTHON_CMD = "python"
     Write-Host "[OK] Using system Python" -ForegroundColor Green

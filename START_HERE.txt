@@ -35,9 +35,18 @@ Q: I get "execution policy" or "not digitally signed" error
 A: Use run.cmd instead of run_discovery.ps1
    The .cmd file bypasses PowerShell execution policy restrictions
 
+Q: I get "no module named socket" error
+A: The bundled Python is incomplete. Use system Python instead:
+   1. Double-click: run_system_python.cmd
+   OR
+   2. Install Python from python.org, then run:
+      python -m pip install -r requirements.txt
+      python azure_discovery.py
+
 Q: Python not found
 A: The bundled Python is in tool\python\ folder
    The script will find it automatically
+   OR use system Python (see socket error solution above)
 
 Q: Azure CLI not found
 A: Install from: https://aka.ms/installazurecliwindows

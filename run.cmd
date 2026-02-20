@@ -29,6 +29,34 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+REM Check bundled Python first
+if exist ".\tool\python\python.exe" (
+    echo Checking bundled Python installation...
+    .\tool\python\python.exe -c "import socket" 2>nul
+    if %errorlevel% neq 0 (
+        echo.
+        echo ========================================================================
+        echo   WARNING: Bundled Python is missing socket module!
+        echo ========================================================================
+        echo.
+        echo   The bundled Python installation appears to be incomplete or corrupted.
+        echo.
+        echo   SOLUTION: Use system Python instead
+        echo   1. Install Python 3.11 from: https://www.python.org/downloads/
+        echo   2. Run: python -m pip install -r requirements.txt
+        echo   3. Run: python azure_discovery.py
+        echo.
+        echo   OR run verification script to diagnose:
+        echo   python verify_python.py
+        echo.
+        echo ========================================================================
+        echo.
+        pause
+        exit /b 1
+    )
+    echo [OK] Bundled Python socket module verified
+)
+
 REM Run PowerShell script with execution policy bypass
 powershell.exe -ExecutionPolicy Bypass -NoProfile -File "%~dp0run_discovery.ps1"
 
