@@ -2789,6 +2789,9 @@ class AzureDiscovery:
         # Add ARM templates section
         html += self._generate_arm_templates_html()
         
+        # Add visual service dependency diagrams
+        html += self._generate_dependency_diagrams_html()
+        
         # Add dependencies section
         html += self._generate_dependencies_html()
         
@@ -2971,6 +2974,332 @@ class AzureDiscovery:
         html += "</div>"
         return html
     
+    def _generate_dependency_diagrams_html(self):
+        """Generate visual dependency diagrams for App Services/Functions and VMs.
+
+        Shows only connections involving:
+          SQL, App Services, Service Bus, Functions, Traffic Manager,
+          Application Gateway, Load Balancer, SMTP, FTP, VMs,
+          Automation Accounts, NSG, Resource Group
+        """
+
+        # ── Color / label map keyed by source_type / target_type strings ──────
+        TYPE_META = {
+            # source_type strings produced by analyze_dependencies()
+            'Azure Function':           ('#e67e22', '⚡', 'Function App'),
+            'App Service':              ('#3498db', '🌐', 'App Service'),
+            'Virtual Machine':          ('#e74c3c', '🖥️',  'Virtual Machine'),
+            # target_type strings
+            'SQL Database':             ('#e74c3c', '🗄️',  'SQL Database'),
+            'SQL Server':               ('#e74c3c', '🗄️',  'SQL Server'),
+            'Service Bus':              ('#9b59b6', '📨', 'Service Bus'),
+            'Event Hub':                ('#8e44ad', '📡', 'Event Hub'),
+            'Traffic Manager':          ('#1abc9c', '🔀', 'Traffic Manager'),
+            'Application Gateway':      ('#f39c12', '🛡️',  'App Gateway'),
+            'Load Balancer':            ('#2ecc71', '⚖️',  'Load Balancer'),
+            'SMTP':                     ('#16a085', '📧', 'SMTP'),
+            'FTP':                      ('#2980b9', '📁', 'FTP'),
+            'Automation Account':       ('#95a5a6', '⚙️',  'Automation'),
+            'Network Security Group':   ('#d35400', '🔒', 'NSG'),
+            'Virtual Network':          ('#27ae60', '🔷', 'VNet'),
+            'Storage Account':          ('#f1c40f', '💾', 'Storage'),
+            'Key Vault':                ('#6c3483', '🔑', 'Key Vault'),
+            'Cosmos DB':                ('#1a5276', '🌍', 'Cosmos DB'),
+            'Redis Cache':              ('#c0392b', '⚡', 'Redis'),
+            'Application Insights':     ('#117a65', '📊', 'App Insights'),
+            'Resource Group':           ('#7f8c8d', '📂', 'Resource Group'),
+            'External API':             ('#bdc3c7', '🌍', 'External API'),
+            'Container Registry':       ('#2471a3', '📦', 'ACR'),
+            'AKS Cluster':              ('#1f618d', '☸️',  'AKS'),
+        }
+
+        ALLOWED_TARGETS = {
+            'SQL Database', 'SQL Server', 'Service Bus', 'Event Hub',
+            'Traffic Manager', 'Application Gateway', 'Load Balancer',
+            'SMTP', 'FTP', 'Virtual Machine', 'Automation Account',
+            'Network Security Group', 'Resource Group',
+            'Storage Account', 'Key Vault', 'Cosmos DB', 'Redis Cache',
+            'Application Insights', 'Virtual Network',
+        }
+
+        def meta(t):
+            return TYPE_META.get(t, ('#aaaaaa', '●', t))
+
+        all_deps = self.discovery_data.get('dependencies', [])
+
+        # Split deps into the two diagrams
+        app_deps = [d for d in all_deps
+                    if d['source_type'] in ('App Service', 'Azure Function')
+                    and d['target_type'] in ALLOWED_TARGETS]
+
+        vm_deps  = [d for d in all_deps
+                    if d['source_type'] == 'Virtual Machine'
+                    and d['target_type'] in ALLOWED_TARGETS]
+
+        def build_diagram_html(title, icon, deps, diagram_id):
+            if not deps:
+                return f'''
+        <div class="dep-section">
+            <h3>{icon} {title}</h3>
+            <div class="dd-nodata">
+                ⚠ No dependencies discovered for {title}.<br>
+                Ensure App Settings / Connection Strings reference Azure service endpoints.
+            </div>
+        </div>'''
+
+            # Collect unique nodes
+            nodes_map = {}   # name → meta
+            for d in deps:
+                sc, si, sl = meta(d['source_type'])
+                tc, ti, tl = meta(d['target_type'])
+                nodes_map[d['source']] = (sc, si, sl)
+                nodes_map[d['target']] = (tc, ti, tl)
+
+            # Build node list with positions
+            node_list = list(nodes_map.items())   # [(name, (color,icon,label))]
+            n = len(node_list)
+            cols = max(1, min(6, n))
+
+            nodes_js_parts = []
+            for i, (name, (color, ico, lbl)) in enumerate(node_list):
+                safe_name = name.replace('"', '\\"')
+                safe_lbl  = lbl.replace('"', '\\"')
+                col_pos   = i % cols
+                row_pos   = i // cols
+                x = 30 + col_pos * 185
+                y = 30 + row_pos * 110
+                nodes_js_parts.append(
+                    f'{{id:"{safe_name}",label:"{safe_lbl}",color:"{color}",'
+                    f'x:{x},y:{y}}}'
+                )
+            nodes_js = '[' + ','.join(nodes_js_parts) + ']'
+
+            edges_js_parts = []
+            for d in deps:
+                _, _, dep_lbl = meta(d['dependency_type']) if d['dependency_type'] in TYPE_META else ('#888', '', d['dependency_type'])
+                safe_src = d['source'].replace('"', '\\"')
+                safe_tgt = d['target'].replace('"', '\\"')
+                safe_dep = d['dependency_type'].replace('"', '\\"')
+                tc, _, _ = meta(d['target_type'])
+                edges_js_parts.append(
+                    f'{{s:"{safe_src}",t:"{safe_tgt}",dep:"{safe_dep}",color:"{tc}"}}'
+                )
+            edges_js = '[' + ','.join(edges_js_parts) + ']'
+
+            # Table rows
+            table_rows = ''
+            for d in deps:
+                sc, si, _ = meta(d['source_type'])
+                tc, ti, _ = meta(d['target_type'])
+                table_rows += (
+                    f'<tr>'
+                    f'<td><span class="dd-badge" style="background:{sc}">{si} {d["source_type"]}</span>'
+                    f'<br><strong>{d["source"]}</strong></td>'
+                    f'<td class="dd-arrow">→</td>'
+                    f'<td><span class="dd-badge" style="background:{tc}">{ti} {d["target_type"]}</span>'
+                    f'<br><strong>{d["target"]}</strong></td>'
+                    f'<td><small>{d["dependency_type"]}</small></td>'
+                    f'</tr>'
+                )
+
+            rows_high = max(2, (n // cols) + 1)
+            canvas_h  = rows_high * 110 + 60
+
+            return f'''
+        <div class="dep-section">
+            <h3>{icon} {title} <span class="dd-count">{len(deps)} connections</span></h3>
+
+            <div class="dd-canvas-wrap">
+                <canvas id="{diagram_id}" style="width:100%;height:{canvas_h}px"></canvas>
+            </div>
+
+            <h4 style="margin:18px 0 8px;color:#2c3e50">📋 Connection Table</h4>
+            <table class="dd-table">
+                <thead>
+                    <tr><th>Source Resource</th><th></th><th>Target Resource</th><th>Connection Type</th></tr>
+                </thead>
+                <tbody>{table_rows}</tbody>
+            </table>
+        </div>
+
+        <script>
+        (function(){{
+            var NODES = {nodes_js};
+            var EDGES = {edges_js};
+            var canvas = document.getElementById('{diagram_id}');
+            if (!canvas) return;
+
+            // Scale canvas for retina
+            var dpr = window.devicePixelRatio || 1;
+            var rect = canvas.getBoundingClientRect();
+            var W = canvas.parentElement.offsetWidth - 20 || 1060;
+            var H = {canvas_h};
+            canvas.width  = W * dpr;
+            canvas.height = H * dpr;
+            canvas.style.width  = W + 'px';
+            canvas.style.height = H + 'px';
+            var ctx = canvas.getContext('2d');
+            ctx.scale(dpr, dpr);
+
+            // Re-calculate positions to fill full width
+            var cols = Math.ceil(Math.sqrt(NODES.length));
+            var spacX = Math.max(160, (W - 30) / (cols + 0.5));
+            var spacY = 110;
+            NODES.forEach(function(n, i){{
+                n.x = 20 + (i % cols) * spacX;
+                n.y = 30 + Math.floor(i / cols) * spacY;
+            }});
+            var nmap = {{}};
+            NODES.forEach(function(n){{ nmap[n.id] = n; }});
+
+            // Draw edges first
+            EDGES.forEach(function(e){{
+                var s = nmap[e.s], t = nmap[e.t];
+                if (!s || !t) return;
+                var sx = s.x + 90, sy = s.y + 22;
+                var tx = t.x + 90, ty = t.y + 22;
+                ctx.beginPath();
+                ctx.moveTo(sx, sy);
+                // Slight curve
+                var mx = (sx + tx) / 2, my = (sy + ty) / 2 - 20;
+                ctx.quadraticCurveTo(mx, my, tx, ty);
+                ctx.strokeStyle = e.color + '88';
+                ctx.lineWidth = 1.8;
+                ctx.stroke();
+                // Arrowhead
+                var ang = Math.atan2(ty - my, tx - mx);
+                ctx.beginPath();
+                ctx.moveTo(tx, ty);
+                ctx.lineTo(tx - 10*Math.cos(ang-0.35), ty - 10*Math.sin(ang-0.35));
+                ctx.lineTo(tx - 10*Math.cos(ang+0.35), ty - 10*Math.sin(ang+0.35));
+                ctx.closePath();
+                ctx.fillStyle = e.color;
+                ctx.fill();
+                // Label on edge
+                ctx.fillStyle = '#666';
+                ctx.font = '9px Arial';
+                ctx.textAlign = 'center';
+                ctx.fillText(e.dep, mx, my - 4);
+            }});
+
+            // Draw nodes
+            NODES.forEach(function(n){{
+                var bw = 180, bh = 44, br = 8;
+                // Shadow
+                ctx.shadowColor = 'rgba(0,0,0,0.15)';
+                ctx.shadowBlur  = 6;
+                ctx.shadowOffsetY = 3;
+                // Box
+                ctx.beginPath();
+                ctx.roundRect(n.x, n.y, bw, bh, br);
+                ctx.fillStyle = n.color;
+                ctx.fill();
+                ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+                // Top label (type)
+                ctx.fillStyle = 'rgba(255,255,255,0.85)';
+                ctx.font = 'bold 10px Arial';
+                ctx.textAlign = 'center';
+                ctx.fillText(n.label, n.x + bw/2, n.y + 14);
+                // Bottom label (name, truncated)
+                var nm = n.id.length > 22 ? n.id.substring(0,20) + '..' : n.id;
+                ctx.fillStyle = '#fff';
+                ctx.font = '9px Arial';
+                ctx.fillText(nm, n.x + bw/2, n.y + 30);
+            }});
+        }})();
+        </script>'''
+
+        # ── Legend ──────────────────────────────────────────────────────────────
+        legend_items = [
+            ('#e74c3c', 'SQL / VM'),
+            ('#3498db', 'App Service'),
+            ('#e67e22', 'Function App'),
+            ('#9b59b6', 'Service Bus'),
+            ('#1abc9c', 'Traffic Manager'),
+            ('#f39c12', 'App Gateway'),
+            ('#2ecc71', 'Load Balancer'),
+            ('#95a5a6', 'Automation Account'),
+            ('#d35400', 'NSG'),
+            ('#7f8c8d', 'Resource Group'),
+            ('#6c3483', 'Key Vault'),
+            ('#f1c40f', 'Storage'),
+            ('#117a65', 'App Insights'),
+            ('#1a5276', 'Cosmos DB'),
+            ('#c0392b', 'Redis'),
+        ]
+        legend_html = '<div class="dd-legend">' + ''.join(
+            f'<span class="dd-legend-item">'
+            f'<span class="dd-dot" style="background:{c}"></span>{lbl}'
+            f'</span>'
+            for c, lbl in legend_items
+        ) + '</div>'
+
+        css = '''
+        <style>
+        .dd-section-wrap { margin:0 0 30px 0; }
+        .dep-section {
+            background:#fff; border-radius:12px; padding:22px 24px;
+            margin-bottom:28px; box-shadow:0 2px 10px rgba(0,0,0,0.08);
+        }
+        .dep-section h3 {
+            color:#2c3e50; border-bottom:3px solid #3498db;
+            padding-bottom:10px; margin-bottom:16px; font-size:16px;
+        }
+        .dd-count {
+            background:#ecf0f1; color:#7f8c8d; font-size:12px;
+            padding:2px 10px; border-radius:12px; margin-left:8px;
+        }
+        .dd-canvas-wrap {
+            background:#f8f9fa; border-radius:8px; padding:10px;
+            overflow-x:auto; min-height:80px;
+        }
+        .dd-table {
+            width:100%; border-collapse:collapse; font-size:12px; margin-top:6px;
+        }
+        .dd-table th {
+            background:#2c3e50; color:#fff; padding:9px 12px; text-align:left;
+        }
+        .dd-table td { padding:7px 12px; border-bottom:1px solid #eee; vertical-align:middle; }
+        .dd-table tr:hover { background:#f0f4ff; }
+        .dd-badge {
+            display:inline-block; padding:2px 8px; border-radius:10px;
+            color:#fff; font-size:10px; margin-bottom:3px;
+        }
+        .dd-arrow { font-size:20px; color:#3498db; font-weight:bold; text-align:center; }
+        .dd-legend {
+            display:flex; flex-wrap:wrap; gap:10px;
+            padding:12px 16px; background:#f8f9fa; border-radius:8px;
+            margin-bottom:20px;
+        }
+        .dd-legend-item { display:flex; align-items:center; gap:6px; font-size:11px; color:#555; }
+        .dd-dot { width:13px; height:13px; border-radius:50%; display:inline-block; flex-shrink:0; }
+        .dd-nodata {
+            padding:18px 20px; background:#fff3cd; border-radius:8px;
+            color:#856404; font-size:13px; line-height:1.6;
+        }
+        </style>'''
+
+        app_section = build_diagram_html(
+            'App Services &amp; Functions → Dependencies', '🌐', app_deps, 'ddAppCanvas'
+        )
+        vm_section = build_diagram_html(
+            'Virtual Machines → Dependencies', '🖥️', vm_deps, 'ddVmCanvas'
+        )
+
+        return f'''
+        <div class="section dd-section-wrap">
+            <h2>📊 Service Dependency Diagrams</h2>
+            <p style="color:#666;margin-bottom:16px">
+                Visual map of connections between Azure resources.
+                Scoped to: SQL, App Services, Service Bus, Functions, Traffic Manager,
+                App Gateway, Load Balancer, SMTP, FTP, VMs, Automation Accounts, NSG, Resource Group.
+            </p>
+            {css}
+            {legend_html}
+            {app_section}
+            {vm_section}
+        </div>'''
+
     def _generate_dependencies_html(self):
         """Generate HTML for dependencies"""
         html = """
