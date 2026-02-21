@@ -288,13 +288,6 @@ class AzureDiscovery:
             if not project_name or 'YOUR_' in str(project_name):
                 print(f"  ⚠ Skipping project with placeholder or empty name: '{project_name}'")
                 continue
-
-            # Skip entries that look like unedited template placeholders
-            # (all-uppercase names like PROJECT1, PROJECT2, MYPROJECT)
-            import re as _re
-            if _re.fullmatch(r'[A-Z][A-Z0-9_]*', str(project_name)):
-                print(f"  ⚠ Skipping project with placeholder-like name: '{project_name}' (update config.json with real project name)")
-                continue
             
             for repo in repositories:
                 if isinstance(repo, dict):
@@ -305,13 +298,6 @@ class AzureDiscovery:
                     repo_branch = None
                 
                 if not repo_name or 'YOUR_' in str(repo_name):
-                    continue
-                
-                # Skip entries that look like unedited template placeholders
-                # (all-uppercase words with no spaces, e.g. PROJECT2, REPO1, WEBAPP)
-                import re as _re
-                if _re.fullmatch(r'[A-Z][A-Z0-9_]*', str(repo_name)):
-                    print(f"  ⚠ Skipping repo with placeholder-like name: '{repo_name}' (update config.json)")
                     continue
                 
                 # URL-encode PAT token to handle special characters (=, +, /, etc.)
@@ -2050,9 +2036,17 @@ class AzureDiscovery:
             git.Repo.clone_from(repo_url, repo_path, **clone_kwargs)
 
         def _do_clone_ssl_bypass():
-            """Use git custom_environment context manager – the correct GitPython way."""
-            with git.cmd.Git().custom_environment(GIT_SSL_NO_VERIFY='1'):
+            """Bypass SSL by temporarily patching os.environ – the only reliable way
+            to affect git.Repo.clone_from which creates its own git.cmd.Git instance."""
+            old_val = os.environ.get('GIT_SSL_NO_VERIFY')
+            os.environ['GIT_SSL_NO_VERIFY'] = '1'
+            try:
                 git.Repo.clone_from(repo_url, repo_path, **clone_kwargs)
+            finally:
+                if old_val is None:
+                    os.environ.pop('GIT_SSL_NO_VERIFY', None)
+                else:
+                    os.environ['GIT_SSL_NO_VERIFY'] = old_val
 
         def _do_pull_normal(repo_obj):
             origin = repo_obj.remotes.origin
@@ -2125,59 +2119,113 @@ class AzureDiscovery:
     def scan_git_repositories(self):
         """Scan Git repositories for external dependencies"""
         import urllib.parse
+        import subprocess
 
         repos = self.config.get('git_repos', [])
 
-        # ── Diagnostics: show what's in config ──────────────────────────────
+        # ── Diagnostics header ───────────────────────────────────────────────
         self.logger.info("\n" + "="*80)
         self.logger.info("Scanning Git Repositories")
         self.logger.info("="*80)
-        self.logger.info(f"  scan_code   : {self.config.get('scan_code', False)}")
-        self.logger.info(f"  git_repos   : {len(repos)} repo(s) configured")
+        self.logger.info(f"  scan_code : {self.config.get('scan_code', False)}")
+        self.logger.info(f"  git_repos : {len(repos)} repo(s) configured")
         devops = self.config.get('azure_devops', {})
-        self.logger.info(f"  DevOps org  : {devops.get('organization', 'not set')}")
-        self.logger.info(f"  DevOps PAT  : {'SET' if devops.get('pat_token') and 'YOUR_' not in str(devops.get('pat_token','')) else 'NOT SET / placeholder'}")
+        org    = devops.get('organization', '')
+        pat    = devops.get('pat_token', '')
+        pat_ok = bool(pat) and 'YOUR_' not in str(pat)
+        self.logger.info(f"  DevOps org: {org if org else 'not set'}")
+        self.logger.info(f"  DevOps PAT: {'SET' if pat_ok else 'NOT SET or placeholder'}")
 
         if not repos:
-            self.logger.warning("  ⚠ No Git repositories configured for scanning.")
-            self.logger.warning("  To add repos, edit config.json:")
-            self.logger.warning("    Option A – Azure DevOps:")
-            self.logger.warning('      Set azure_devops.organization, pat_token, and projects[].repositories')
-            self.logger.warning("    Option B – Any Git URL:")
-            self.logger.warning('      Set git_repos: [{"url": "https://...", "branch": "main"}]')
+            self.logger.warning("  !! No Git repositories configured.")
+            self.logger.warning("     Edit config.json -> azure_devops -> projects -> repositories")
+            self.logger.warning("     OR add full URLs to git_repos array directly.")
             return
-        
+
         temp_dir = os.path.join(self.config['output_dir'], 'temp_repos')
         os.makedirs(temp_dir, exist_ok=True)
         scanned = 0
         failed  = 0
 
-        for repo_config in repos:
+        for idx, repo_config in enumerate(repos, 1):
             repo_url    = repo_config['url']    if isinstance(repo_config, dict) else repo_config
             repo_branch = repo_config.get('branch') if isinstance(repo_config, dict) else None
 
-            # Safe URL for logging (mask password/PAT)
+            # Mask PAT/password in display URL
             try:
                 parsed   = urllib.parse.urlparse(repo_url)
                 safe_url = repo_url.replace(parsed.password or '', '***') if parsed.password else repo_url
             except Exception:
                 safe_url = repo_url
 
-            branch_info = f" (branch: {repo_branch})" if repo_branch else ""
-            self.logger.info(f"\n→ Repo: {safe_url}{branch_info}")
+            branch_info = f" (branch: {repo_branch})" if repo_branch else " (default branch)"
+            self.logger.info(f"\n  [{idx}/{len(repos)}] {safe_url}{branch_info}")
 
-            repo_name = repo_url.split('/')[-1].replace('.git', '')
+            repo_name = repo_url.rstrip('/').split('/')[-1].replace('.git', '')
             repo_path = os.path.join(temp_dir, repo_name)
 
+            # ── Pre-flight: test reachability with git ls-remote ─────────────
+            self.logger.info(f"      Testing connectivity...")
+            try:
+                ls_env = os.environ.copy()
+                ls_env['GIT_SSL_NO_VERIFY'] = '1'
+                ls_env['GIT_TERMINAL_PROMPT'] = '0'  # never hang waiting for password
+                ls_result = subprocess.run(
+                    ['git', 'ls-remote', '--heads', repo_url],
+                    capture_output=True, text=True, timeout=30, env=ls_env
+                )
+                if ls_result.returncode == 0:
+                    heads = [
+                        line.split('\t')[1].replace('refs/heads/', '')
+                        for line in ls_result.stdout.strip().splitlines() if '\t' in line
+                    ]
+                    self.logger.info(f"      Reachable - branches: {heads if heads else '(empty repo)'}")
+                    if repo_branch and repo_branch not in heads:
+                        self.logger.warning(f"      !! Branch '{repo_branch}' not found on remote.")
+                        self.logger.warning(f"         Available: {heads}")
+                        self.logger.warning(f"         Update the branch field in config.json for this repo.")
+                else:
+                    err = (ls_result.stderr or '').strip()
+                    self.logger.error(f"      !! Cannot reach repo. Git error:")
+                    for line in err.splitlines():
+                        self.logger.error(f"         {line}")
+                    if '401' in err or '403' in err or 'authentication' in err.lower() or 'credential' in err.lower():
+                        self.logger.error(f"      Fix: Azure DevOps -> User Settings -> Personal Access Tokens")
+                        self.logger.error(f"           Create/renew PAT with scope: Code (Read)")
+                        self.logger.error(f"           Update pat_token in config.json")
+                        failed += 1
+                        continue
+                    elif '404' in err or 'not found' in err.lower() or 'does not exist' in err.lower():
+                        self.logger.error(f"      Fix: Check organization / project_name / repository name in config.json")
+                        failed += 1
+                        continue
+                    # else: non-fatal warning, still try the clone
+            except subprocess.TimeoutExpired:
+                self.logger.warning(f"      ls-remote timed out (30s) - network may be slow or blocked")
+            except FileNotFoundError:
+                self.logger.warning(f"      'git' not found in PATH - skipping preflight check")
+            except Exception as ls_err:
+                self.logger.warning(f"      Preflight check skipped: {ls_err}")
+
+            # ── Clone / pull ─────────────────────────────────────────────────
             try:
                 self._clone_repo_with_ssl_fallback(repo_url, repo_path, repo_branch)
+                self.logger.info(f"      Scanning code...")
                 self.scan_repository_code(repo_path, repo_name)
                 scanned += 1
+                self.logger.info(f"      Done - {repo_name}")
             except Exception as e:
-                self.logger.error(f"  ✗ Failed to scan {safe_url}: {e}")
+                err_str = str(e)
+                self.logger.error(f"      !! Clone/scan failed: {err_str[:400]}")
+                if '401' in err_str or '403' in err_str:
+                    self.logger.error(f"         -> Authentication error. Check PAT token in config.json.")
+                elif '404' in err_str or 'not found' in err_str.lower():
+                    self.logger.error(f"         -> Repository not found. Check org/project/repo names.")
+                elif 'ssl' in err_str.lower() or 'certificate' in err_str.lower():
+                    self.logger.error(f"         -> SSL error. Run: git config --global http.sslBackend schannel")
                 failed += 1
 
-        self.logger.info(f"\n  Code scanning complete: {scanned} scanned, {failed} failed")
+        self.logger.info(f"\n  Code scanning complete: {scanned} succeeded, {failed} failed out of {len(repos)} repo(s)")
     
     def scan_repository_code(self, repo_path, repo_name):
         """Scan repository code for dependencies and configurations"""
