@@ -241,80 +241,87 @@ class AzureDiscovery:
             result = subprocess.run(['az', '--version'], 
                                   capture_output=True, 
                                   text=True, 
-                                  timeout=10)
+                                  timeout=10,
+                                  shell=True)
             if result.returncode != 0:
-                self.logger.error("❌ Azure CLI not found. Please install Azure CLI.")
-                return False
-            self.logger.info("✓ Azure CLI is installed")
+                self.logger.warning("⚠ Azure CLI check failed - but will continue with SDK authentication")
+                self.logger.debug(f"Error: {result.stderr}")
+            else:
+                self.logger.info("✓ Azure CLI is installed")
             
             # Check if logged in
             result = subprocess.run(['az', 'account', 'show'], 
                                   capture_output=True, 
                                   text=True, 
-                                  timeout=30)
+                                  timeout=30,
+                                  shell=True)
             if result.returncode != 0:
-                self.logger.error("❌ Not logged in to Azure. Please run: az login")
-                return False
-            self.logger.info("✓ Azure CLI is authenticated")
+                self.logger.warning("⚠ Azure CLI authentication check failed - but will continue with SDK")
+                self.logger.debug(f"Error: {result.stderr}")
+            else:
+                self.logger.info("✓ Azure CLI is authenticated")
             
             # List subscriptions
-            self.logger.info("\nTesting subscription access...")
+            self.logger.info("\nTesting subscription access via Azure CLI...")
             result = subprocess.run(['az', 'account', 'list', '--output', 'json'], 
                                   capture_output=True, 
                                   text=True, 
-                                  timeout=30)
+                                  timeout=30,
+                                  shell=True)
             if result.returncode != 0:
-                self.logger.error("❌ Cannot list subscriptions")
-                return False
-            
-            import json as json_module
-            subs = json_module.loads(result.stdout)
-            if not subs:
-                self.logger.warning("⚠ No subscriptions found!")
-                return False
-            
-            self.logger.info(f"✓ Found {len(subs)} subscription(s):")
-            for sub in subs:
-                self.logger.info(f"   - {sub['name']} (ID: {sub['id']})")
-            
-            # Test resource listing on first subscription
-            if subs:
-                test_sub_id = subs[0]['id']
-                self.logger.info(f"\nTesting resource listing on: {subs[0]['name']}...")
-                result = subprocess.run(['az', 'resource', 'list', 
-                                       '--subscription', test_sub_id,
-                                       '--output', 'json'], 
-                                      capture_output=True, 
-                                      text=True, 
-                                      timeout=60)
-                if result.returncode != 0:
-                    self.logger.error(f"❌ Cannot list resources: {result.stderr}")
-                    return False
-                
-                resources = json_module.loads(result.stdout)
-                self.logger.info(f"✓ Successfully listed {len(resources)} resource(s)")
-                if len(resources) == 0:
-                    self.logger.warning("⚠ No resources found in this subscription")
-                else:
-                    self.logger.info(f"   Sample resources:")
-                    for res in resources[:5]:  # Show first 5
-                        self.logger.info(f"   - {res.get('name')} ({res.get('type')})")
+                self.logger.warning("⚠ Cannot list subscriptions via CLI - will use SDK instead")
+                self.logger.debug(f"Error: {result.stderr}")
+            else:
+                import json as json_module
+                try:
+                    subs = json_module.loads(result.stdout)
+                    if not subs:
+                        self.logger.warning("⚠ No subscriptions found via CLI!")
+                    else:
+                        self.logger.info(f"✓ Found {len(subs)} subscription(s) via CLI:")
+                        for sub in subs[:3]:  # Show first 3
+                            self.logger.info(f"   - {sub['name']} (ID: {sub['id']})")
+                        
+                        # Test resource listing on first subscription
+                        test_sub_id = subs[0]['id']
+                        self.logger.info(f"\nTesting resource listing on: {subs[0]['name']}...")
+                        result = subprocess.run(['az', 'resource', 'list', 
+                                               '--subscription', test_sub_id,
+                                               '--output', 'json'], 
+                                              capture_output=True, 
+                                              text=True, 
+                                              timeout=60,
+                                              shell=True)
+                        if result.returncode != 0:
+                            self.logger.warning(f"⚠ Cannot list resources via CLI: {result.stderr}")
+                        else:
+                            resources = json_module.loads(result.stdout)
+                            self.logger.info(f"✓ Successfully listed {len(resources)} resource(s) via CLI")
+                            if len(resources) == 0:
+                                self.logger.warning("⚠ No resources found in this subscription")
+                            else:
+                                self.logger.info(f"   Sample resources:")
+                                for res in resources[:5]:  # Show first 5
+                                    self.logger.info(f"   - {res.get('name')} ({res.get('type')})")
+                except json_module.JSONDecodeError as e:
+                    self.logger.warning(f"⚠ Could not parse CLI output: {e}")
             
             self.logger.info("\n" + "="*80)
-            self.logger.info("✅ AZURE CONNECTIVITY VERIFIED - Proceeding with discovery")
+            self.logger.info("✅ CONNECTIVITY CHECK COMPLETED - Proceeding with SDK-based discovery")
             self.logger.info("="*80 + "\n")
-            return True
+            return True  # Always return True, as CLI is optional
             
         except subprocess.TimeoutExpired:
-            self.logger.error("❌ Azure CLI command timed out")
-            return False
+            self.logger.warning("⚠ Azure CLI command timed out - will use SDK instead")
+            return True  # Continue anyway
         except FileNotFoundError:
-            self.logger.error("❌ Azure CLI (az) not found in PATH")
-            return False
+            self.logger.warning("⚠ Azure CLI (az) not found in PATH - will use SDK authentication instead")
+            self.logger.info("   The tool will use Azure SDK with DefaultAzureCredential")
+            return True  # Continue with SDK
         except Exception as e:
-            self.logger.error(f"❌ Verification failed: {e}")
-            self.logger.error(traceback.format_exc())
-            return False
+            self.logger.warning(f"⚠ CLI verification failed: {e} - will use SDK instead")
+            self.logger.debug(traceback.format_exc())
+            return True  # Continue with SDK
     
     def get_subscriptions(self) -> List[Dict]:
         """Get all accessible subscriptions"""
@@ -3363,18 +3370,8 @@ class AzureDiscovery:
         try:
             self.logger.info("Starting Azure Discovery Process...")
             
-            # Verify Azure connectivity first
-            if not self.verify_azure_connectivity():
-                self.logger.error("\n❌ Azure connectivity verification failed!")
-                self.logger.error("Please ensure:")
-                self.logger.error("  1. Azure CLI is installed")
-                self.logger.error("  2. You are logged in (run: az login)")
-                self.logger.error("  3. You have access to at least one subscription")
-                self.logger.error("  4. You have permissions to list resources")
-                return {
-                    'success': False,
-                    'error': 'Azure connectivity verification failed'
-                }
+            # Verify Azure connectivity (optional - uses CLI if available, otherwise SDK)
+            self.verify_azure_connectivity()
             
             # Get subscriptions
             subscriptions = self.get_subscriptions()
