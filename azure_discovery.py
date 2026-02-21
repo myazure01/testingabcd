@@ -74,6 +74,125 @@ except ImportError as e:
     sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
+# Module-level helpers used by both discovery and dependency analysis
+# ---------------------------------------------------------------------------
+
+def _extract_azure_service_hint(raw_connection_string: str) -> str:
+    """Parse a raw connection string / URL value and return a short hint such as
+    'ServiceBus:mynamespace', 'CosmosDB:myaccount', 'Redis:mycache', 'SQL:myserver',
+    'Storage:mystorageacct', 'KeyVault:myvault', 'EventHub:mynamespace/myentity'.
+    Returns '' when no known Azure endpoint is found.
+    """
+    v = str(raw_connection_string)
+    # Service Bus / Event Hub  (EntityPath= distinguishes EH from SB)
+    m = re.search(r'(?:Endpoint=sb://)?([a-zA-Z0-9\-]+)\.servicebus\.windows\.net', v, re.I)
+    if m:
+        ns = m.group(1)
+        ep = re.search(r'EntityPath=([^;\s]+)', v, re.I)
+        if ep:
+            return f'EventHub:{ns}/{ep.group(1)}'
+        return f'ServiceBus:{ns}'
+    # Cosmos DB
+    m = re.search(
+        r'AccountEndpoint=https://([a-zA-Z0-9\-]+)\.documents\.azure\.com'
+        r'|([a-zA-Z0-9\-]+)\.(?:documents|mongo\.cosmos|table\.cosmos|cassandra\.cosmos)\.azure\.com',
+        v, re.I)
+    if m:
+        return f'CosmosDB:{m.group(1) or m.group(2)}'
+    # Redis
+    m = re.search(r'([a-zA-Z0-9\-]+)\.redis\.cache\.windows\.net', v, re.I)
+    if m:
+        return f'Redis:{m.group(1)}'
+    # Key Vault
+    m = re.search(
+        r'@Microsoft\.KeyVault\((?:VaultName=([a-zA-Z0-9\-]+)|SecretUri=https://([a-zA-Z0-9\-]+)\.vault\.azure\.net)'
+        r'|([a-zA-Z0-9\-]+)\.vault\.azure\.net',
+        v, re.I)
+    if m:
+        kv = m.group(1) or m.group(2) or m.group(3)
+        if kv:
+            return f'KeyVault:{kv}'
+    # SQL
+    m = re.search(r'([a-zA-Z0-9\-]+)\.database\.windows\.net', v, re.I)
+    if m:
+        return f'SQL:{m.group(1)}'
+    # Storage
+    m = (re.search(r'AccountName=([a-zA-Z0-9]+)', v, re.I) or
+         re.search(r'([a-zA-Z0-9]+)\.(?:blob|table|queue|file)\.core\.windows\.net', v, re.I))
+    if m:
+        return f'Storage:{m.group(1)}'
+    return ''
+
+
+def _detect_service_from_key_name(key: str) -> str:
+    """For masked app settings whose value is hidden, try to guess the Azure service
+    type from the *key name* alone.  Returns a service hint string like 'ServiceBus'
+    or '' when nothing matches.
+    """
+    k = key.upper()
+    if any(s in k for s in ['SERVICEBUS', 'SERVICE_BUS']):
+        return 'ServiceBus'
+    if any(s in k for s in ['EVENTHUB', 'EVENT_HUB']):
+        return 'EventHub'
+    if any(s in k for s in ['COSMOS', 'DOCUMENTDB']):
+        return 'CosmosDB'
+    if any(s in k for s in ['REDIS']):
+        return 'Redis'
+    if any(s in k for s in ['KEYVAULT', 'KEY_VAULT']):
+        return 'KeyVault'
+    if any(s in k for s in ['SQL', 'DATABASE', 'DB_']):
+        return 'SQL'
+    if any(s in k for s in ['STORAGE', 'AZUREWEBJOBSSTORAGE', 'BLOB']):
+        return 'Storage'
+    return ''
+
+
+def _add_dep_from_hint(hint, setting_key, app_name, source_type, sub_id, dependencies,
+                       sb_lookup, eh_lookup, cosmos_lookup, redis_lookup,
+                       kv_lookup, sql_lookup, storage_lookup):
+    """Append a dependency dict using a hint string like 'ServiceBus:mynamespace'.
+    When resource is '_masked_' (value was not available), attempts to resolve via
+    the lookup map — if only one resource of that type exists it is assumed.
+    """
+    if not hint:
+        return
+    service, _, resource = hint.partition(':')
+    resource_lower = resource.lower().split('/')[0]  # strip EventHub entity part
+
+    service_map = {
+        'ServiceBus': ('Service Bus',     'Service Bus Connection', sb_lookup),
+        'EventHub':   ('Event Hub',       'Event Hub Connection',   eh_lookup),
+        'CosmosDB':   ('Cosmos DB',       'Cosmos DB Connection',   cosmos_lookup),
+        'Redis':      ('Redis Cache',     'Redis Connection',       redis_lookup),
+        'KeyVault':   ('Key Vault',       'Key Vault Reference',    kv_lookup),
+        'SQL':        ('SQL Server',      'SQL Connection',         sql_lookup),
+        'Storage':    ('Storage Account', 'Storage Connection',     storage_lookup),
+    }
+    if service not in service_map:
+        return
+    target_type, dep_type, lookup = service_map[service]
+
+    if resource == '_masked_':
+        # Value was masked — only the key name hinted at the service type
+        if len(lookup) == 1:
+            target = next(iter(lookup.values()))
+        elif len(lookup) > 1:
+            target = f'{target_type} (ref: {setting_key})'
+        else:
+            target = target_type
+    else:
+        # Actual resource name extracted — try to resolve against discovered resources
+        target = lookup.get(resource_lower, resource)
+
+    dependencies.append({
+        'source': app_name, 'source_type': source_type,
+        'target': target, 'target_type': target_type,
+        'dependency_type': dep_type, 'setting_key': setting_key,
+        'subscription': sub_id
+    })
+
+
 class AzureDiscovery:
     """Main Azure Discovery class"""
     
@@ -854,12 +973,15 @@ class AzureDiscovery:
                     conn_strings = web_client.web_apps.list_connection_strings(rg_name, app.name)
                     if conn_strings and conn_strings.properties:
                         for key, value in conn_strings.properties.items():
+                            # Parse Azure service endpoint BEFORE masking the value
+                            raw_val = str(value.value) if value.value else ''
+                            azure_hint = _extract_azure_service_hint(raw_val)
                             app_info['connection_strings'][key] = {
                                 'type': value.type,
-                                'value': '***MASKED***'  # Never expose connection strings
+                                'value': '***MASKED***',  # Never expose connection strings in output
+                                'azure_hint': azure_hint  # e.g. "ServiceBus:mynamespace"
                             }
-                            
-                            # Analyze dependency from connection string type
+
                             if value.type:
                                 app_info['external_dependencies'].append({
                                     'type': f'Connection String - {value.type}',
@@ -1484,6 +1606,16 @@ class AzureDiscovery:
                 for setting_key, setting_value in all_settings.items():
                     val = str(setting_value)
                     if not val or val == '***MASKED***':
+                        # Value is masked (key name had password/secret/key/token).
+                        # Still try to detect the service type from the KEY NAME alone.
+                        svc = _detect_service_from_key_name(setting_key)
+                        if svc:
+                            _add_dep_from_hint(
+                                f'{svc}:_masked_', setting_key, app_name, source_type,
+                                sub_id, dependencies,
+                                sb_lookup, eh_lookup, cosmos_lookup, redis_lookup,
+                                kv_lookup, sql_lookup, storage_lookup
+                            )
                         continue
                     
                     # ---- Service Bus ----
@@ -1623,13 +1755,27 @@ class AzureDiscovery:
                         })
                         break
                 
-                # ---- Connection Strings (SQL from type field) ----
+                # ---- Connection Strings (full endpoint detection via azure_hint + SQL type fallback) ----
                 for conn_key, conn_info in app.get('connection_strings', {}).items():
-                    conn_type = conn_info.get('type', '').lower() if isinstance(conn_info, dict) else ''
+                    if not isinstance(conn_info, dict):
+                        continue
+                    conn_type = str(conn_info.get('type', '')).lower()
+                    azure_hint = conn_info.get('azure_hint', '')
+
+                    # Priority 1: use the azure_hint extracted at discovery time (actual endpoint)
+                    if azure_hint:
+                        _add_dep_from_hint(
+                            azure_hint, conn_key, app_name, source_type, sub_id, dependencies,
+                            sb_lookup, eh_lookup, cosmos_lookup, redis_lookup,
+                            kv_lookup, sql_lookup, storage_lookup
+                        )
+                        continue
+
+                    # Priority 2: SQL-typed connection strings (no hostname hint available)
                     if conn_type in ('sqlazure', 'sqlserver', 'sql'):
-                        # Try to match conn_key name against sql_lookup
                         matched_sql = next(
-                            (name for key, name in sql_lookup.items() if key in conn_key.lower() or conn_key.lower() in key),
+                            (name for key, name in sql_lookup.items()
+                             if key in conn_key.lower() or conn_key.lower() in key),
                             conn_key
                         )
                         dependencies.append({
@@ -1638,6 +1784,16 @@ class AzureDiscovery:
                             'dependency_type': 'Connection String (SQL)', 'setting_key': conn_key,
                             'subscription': sub_id
                         })
+                        continue
+
+                    # Priority 3: fallback — use key name hint for other types
+                    svc = _detect_service_from_key_name(conn_key)
+                    if svc:
+                        _add_dep_from_hint(
+                            f'{svc}:_masked_', conn_key, app_name, source_type, sub_id, dependencies,
+                            sb_lookup, eh_lookup, cosmos_lookup, redis_lookup,
+                            kv_lookup, sql_lookup, storage_lookup
+                        )
                     elif conn_key and conn_type not in ('', 'custom'):
                         dependencies.append({
                             'source': app_name, 'source_type': source_type,
