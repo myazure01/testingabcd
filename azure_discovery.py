@@ -231,6 +231,94 @@ class AzureDiscovery:
             self.logger.error(f"Authentication failed: {e}")
             raise
     
+    def verify_azure_connectivity(self) -> bool:
+        """Verify Azure connectivity using az commands before running discovery"""
+        import subprocess
+        
+        self.logger.info("\n" + "="*80)
+        self.logger.info("VERIFYING AZURE CONNECTIVITY")
+        self.logger.info("="*80)
+        
+        try:
+            # Check if az CLI is installed
+            result = subprocess.run(['az', '--version'], 
+                                  capture_output=True, 
+                                  text=True, 
+                                  timeout=10)
+            if result.returncode != 0:
+                self.logger.error("❌ Azure CLI not found. Please install Azure CLI.")
+                return False
+            self.logger.info("✓ Azure CLI is installed")
+            
+            # Check if logged in
+            result = subprocess.run(['az', 'account', 'show'], 
+                                  capture_output=True, 
+                                  text=True, 
+                                  timeout=30)
+            if result.returncode != 0:
+                self.logger.error("❌ Not logged in to Azure. Please run: az login")
+                return False
+            self.logger.info("✓ Azure CLI is authenticated")
+            
+            # List subscriptions
+            self.logger.info("\nTesting subscription access...")
+            result = subprocess.run(['az', 'account', 'list', '--output', 'json'], 
+                                  capture_output=True, 
+                                  text=True, 
+                                  timeout=30)
+            if result.returncode != 0:
+                self.logger.error("❌ Cannot list subscriptions")
+                return False
+            
+            import json as json_module
+            subs = json_module.loads(result.stdout)
+            if not subs:
+                self.logger.warning("⚠ No subscriptions found!")
+                return False
+            
+            self.logger.info(f"✓ Found {len(subs)} subscription(s):")
+            for sub in subs:
+                self.logger.info(f"   - {sub['name']} (ID: {sub['id']})")
+            
+            # Test resource listing on first subscription
+            if subs:
+                test_sub_id = subs[0]['id']
+                self.logger.info(f"\nTesting resource listing on: {subs[0]['name']}...")
+                result = subprocess.run(['az', 'resource', 'list', 
+                                       '--subscription', test_sub_id,
+                                       '--output', 'json'], 
+                                      capture_output=True, 
+                                      text=True, 
+                                      timeout=60)
+                if result.returncode != 0:
+                    self.logger.error(f"❌ Cannot list resources: {result.stderr}")
+                    return False
+                
+                resources = json_module.loads(result.stdout)
+                self.logger.info(f"✓ Successfully listed {len(resources)} resource(s)")
+                if len(resources) == 0:
+                    self.logger.warning("⚠ No resources found in this subscription")
+                else:
+                    self.logger.info(f"   Sample resources:")
+                    for res in resources[:5]:  # Show first 5
+                        self.logger.info(f"   - {res.get('name')} ({res.get('type')})")
+            
+            self.logger.info("\n" + "="*80)
+            self.logger.info("✅ AZURE CONNECTIVITY VERIFIED - Proceeding with discovery")
+            self.logger.info("="*80 + "\n")
+            return True
+            
+        except subprocess.TimeoutExpired:
+            self.logger.error("❌ Azure CLI command timed out")
+            return False
+        except FileNotFoundError:
+            self.logger.error("❌ Azure CLI (az) not found in PATH")
+            return False
+        except Exception as e:
+            self.logger.error(f"❌ Verification failed: {e}")
+            self.logger.error(traceback.format_exc())
+            return False
+    
     def get_subscriptions(self) -> List[Dict]:
         """Get all accessible subscriptions"""
         self.logger.info("Discovering subscriptions...")
@@ -323,38 +411,69 @@ class AzureDiscovery:
             
             # Discover Resource Groups
             self.logger.info("Discovering resource groups...")
-            for rg in resource_client.resource_groups.list():
-                if rg.name not in self.config['excluded_resource_groups']:
-                    sub_data['resource_groups'][rg.name] = {
-                        'name': rg.name,
-                        'location': rg.location,
-                        'tags': rg.tags or {},
-                        'resources': []
-                    }
+            rg_count = 0
+            try:
+                for rg in resource_client.resource_groups.list():
+                    if rg.name not in self.config['excluded_resource_groups']:
+                        sub_data['resource_groups'][rg.name] = {
+                            'name': rg.name,
+                            'location': rg.location,
+                            'tags': rg.tags or {},
+                            'resources': []
+                        }
+                        rg_count += 1
+            except Exception as e:
+                self.logger.error(f"Error listing resource groups: {e}")
+                self.logger.error(traceback.format_exc())
+                
             self.logger.info(f"✓ Found {len(sub_data['resource_groups'])} resource groups")
+            
+            if len(sub_data['resource_groups']) == 0:
+                self.logger.warning(f"⚠ WARNING: No resource groups found in subscription '{subscription_name}'")
+                self.logger.warning("   Please verify access with: az group list --subscription " + subscription_id)
             
             # Discover all resources
             self.logger.info("Discovering all resources...")
-            for resource in resource_client.resources.list():
-                if any(rg in resource.id for rg in self.config['excluded_resource_groups']):
-                    continue
-                    
-                resource_info = {
-                    'name': resource.name,
-                    'type': resource.type,
-                    'location': resource.location,
-                    'id': resource.id,
-                    'tags': resource.tags or {},
-                    'resource_group': resource.id.split('/')[4]
-                }
-                sub_data['resources'].append(resource_info)
-                
-                # Add to resource group
-                rg_name = resource_info['resource_group']
-                if rg_name in sub_data['resource_groups']:
-                    sub_data['resource_groups'][rg_name]['resources'].append(resource_info)
+            resource_count = 0
+            try:
+                for resource in resource_client.resources.list():
+                    try:
+                        if any(rg in resource.id for rg in self.config['excluded_resource_groups']):
+                            continue
+                        
+                        resource_info = {
+                            'name': resource.name,
+                            'type': resource.type,
+                            'location': resource.location,
+                            'id': resource.id,
+                            'tags': resource.tags or {},
+                            'resource_group': resource.id.split('/')[4] if len(resource.id.split('/')) > 4 else 'unknown'
+                        }
+                        sub_data['resources'].append(resource_info)
+                        resource_count += 1
+                        
+                        # Add to resource group
+                        rg_name = resource_info['resource_group']
+                        if rg_name in sub_data['resource_groups']:
+                            sub_data['resource_groups'][rg_name]['resources'].append(resource_info)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to process resource {getattr(resource, 'name', 'unknown')}: {e}")
+                        continue
+                        
+            except Exception as e:
+                self.logger.error(f"Error listing resources: {e}")
+                self.logger.error(traceback.format_exc())
             
             self.logger.info(f"✓ Found {len(sub_data['resources'])} total resources")
+            
+            if len(sub_data['resources']) == 0:
+                self.logger.warning(f"⚠ WARNING: No resources found in subscription '{subscription_name}'")
+                self.logger.warning("   This could indicate:")
+                self.logger.warning("   1. The subscription is empty")
+                self.logger.warning("   2. Insufficient permissions to list resources")
+                self.logger.warning("   3. API throttling or connectivity issues")
+                self.logger.warning("   Please verify with: az resource list --subscription " + subscription_id)
+            
             self.discovery_data['summary']['total_resources'] += len(sub_data['resources'])
             
             # Discover Networks (VNets, Subnets, NSGs, etc.)
@@ -2226,6 +2345,36 @@ class AzureDiscovery:
         </div>
 """
         
+        # Add subscriptions overview section
+        html += """
+        <div class="section">
+            <h2>📋 Subscriptions Scanned</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Subscription Name</th>
+                        <th>Subscription ID</th>
+                        <th>Resource Groups</th>
+                        <th>Total Resources</th>
+                    </tr>
+                </thead>
+                <tbody>
+"""
+        for sub_id, sub_data in self.discovery_data['subscriptions'].items():
+            html += f"""
+                    <tr>
+                        <td><strong>{sub_data['name']}</strong></td>
+                        <td><code>{sub_id}</code></td>
+                        <td>{len(sub_data.get('resource_groups', {}))}</td>
+                        <td>{len(sub_data.get('resources', []))}</td>
+                    </tr>
+"""
+        html += """
+                </tbody>
+            </table>
+        </div>
+"""
+        
         # Add subscription details
         for sub_id, sub_data in self.discovery_data['subscriptions'].items():
             html += self._generate_subscription_html(sub_id, sub_data)
@@ -3217,8 +3366,29 @@ class AzureDiscovery:
         try:
             self.logger.info("Starting Azure Discovery Process...")
             
+            # Verify Azure connectivity first
+            if not self.verify_azure_connectivity():
+                self.logger.error("\n❌ Azure connectivity verification failed!")
+                self.logger.error("Please ensure:")
+                self.logger.error("  1. Azure CLI is installed")
+                self.logger.error("  2. You are logged in (run: az login)")
+                self.logger.error("  3. You have access to at least one subscription")
+                self.logger.error("  4. You have permissions to list resources")
+                return {
+                    'success': False,
+                    'error': 'Azure connectivity verification failed'
+                }
+            
             # Get subscriptions
             subscriptions = self.get_subscriptions()
+            
+            if not subscriptions:
+                self.logger.error("\n❌ No subscriptions found!")
+                self.logger.error("Please ensure you have access to at least one Azure subscription.")
+                return {
+                    'success': False,
+                    'error': 'No subscriptions found'
+                }
             
             # Discover resources in each subscription
             for sub in subscriptions:

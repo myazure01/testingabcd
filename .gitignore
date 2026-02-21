@@ -10,6 +10,9 @@ venv/
 ENV/
 env/
 
+# Bundled Python and packages (large binary distribution)
+tool/
+
 # Discovery output (keep sample files, exclude actual generated output)
 discovery_output/*.xlsx
 discovery_output/*.log
