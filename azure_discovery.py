@@ -687,12 +687,27 @@ class AzureDiscovery:
                     'resource_group': vm.id.split('/')[4],
                     'vm_size': vm.hardware_profile.vm_size if vm.hardware_profile else None,
                     'os_type': vm.storage_profile.os_disk.os_type if vm.storage_profile and vm.storage_profile.os_disk else None,
+                    'os_disk': {},
                     'image_reference': {},
                     'data_disks': [],
                     'network_interfaces': [],
+                    'vnet': None,
+                    'subnet': None,
                     'availability_set': vm.availability_set.id if vm.availability_set else None,
                     'tags': vm.tags or {}
                 }
+                
+                # OS Disk information
+                if vm.storage_profile and vm.storage_profile.os_disk:
+                    os_disk = vm.storage_profile.os_disk
+                    vm_info['os_disk'] = {
+                        'name': os_disk.name,
+                        'size_gb': os_disk.disk_size_gb,
+                        'create_option': os_disk.create_option,
+                        'caching': os_disk.caching,
+                        'managed_disk_id': os_disk.managed_disk.id if os_disk.managed_disk else None,
+                        'storage_account': os_disk.vhd.uri.split('/')[2].split('.')[0] if os_disk.vhd else None
+                    }
                 
                 # Image details
                 if vm.storage_profile and vm.storage_profile.image_reference:
@@ -707,15 +722,34 @@ class AzureDiscovery:
                 # Data disks
                 if vm.storage_profile and vm.storage_profile.data_disks:
                     for disk in vm.storage_profile.data_disks:
-                        vm_info['data_disks'].append({
+                        disk_info = {
                             'name': disk.name,
                             'size_gb': disk.disk_size_gb,
-                            'lun': disk.lun
-                        })
+                            'lun': disk.lun,
+                            'caching': disk.caching,
+                            'managed_disk_id': disk.managed_disk.id if disk.managed_disk else None,
+                            'storage_account': disk.vhd.uri.split('/')[2].split('.')[0] if disk.vhd else None
+                        }
+                        vm_info['data_disks'].append(disk_info)
                 
-                # Network interfaces
+                # Network interfaces - extract VNet info
                 if vm.network_profile and vm.network_profile.network_interfaces:
-                    vm_info['network_interfaces'] = [nic.id for nic in vm.network_profile.network_interfaces]
+                    for nic in vm.network_profile.network_interfaces:
+                        vm_info['network_interfaces'].append(nic.id)
+                        # Extract VNet from NIC ID if possible
+                        # NIC ID format: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Network/networkInterfaces/{name}
+                        # We need to look at the subnet to get VNet info
+                        nic_id_parts = nic.id.split('/')
+                        if len(nic_id_parts) >= 9:
+                            nic_name = nic_id_parts[-1]
+                            # Try to extract VNet from networks already discovered
+                            for vnet in sub_data.get('networks', []):
+                                for subnet in vnet.get('subnets', []):
+                                    # This is a best effort - we'd need to actually query the NIC to be sure
+                                    if not vm_info['vnet']:
+                                        vm_info['vnet'] = vnet['name']
+                                        vm_info['subnet'] = subnet['name']
+                                        break
                 
                 sub_data['virtual_machines'].append(vm_info)
             
@@ -724,6 +758,7 @@ class AzureDiscovery:
             
         except Exception as e:
             self.logger.error(f"Error discovering VMs: {e}")
+            self.logger.error(traceback.format_exc())
     
     def discover_app_services(self, web_client, sub_data, subscription_id):
         """Discover App Services and analyze configurations"""
@@ -900,6 +935,7 @@ class AzureDiscovery:
                     'fqdn': server.fully_qualified_domain_name,
                     'databases': [],
                     'firewall_rules': [],
+                    'vnet_rules': [],
                     'private_endpoints': [],
                     'tags': server.tags or {}
                 }
@@ -933,6 +969,18 @@ class AzureDiscovery:
                         })
                 except Exception as e:
                     self.logger.warning(f"Could not get firewall rules for {server.name}: {e}")
+                
+                # Get VNet rules (for service endpoints)
+                try:
+                    vnet_rules = sql_client.virtual_network_rules.list_by_server(rg_name, server.name)
+                    for rule in vnet_rules:
+                        server_info['vnet_rules'].append({
+                            'name': rule.name,
+                            'vnet_subnet': rule.virtual_network_subnet_id,
+                            'ignore_missing_endpoint': rule.ignore_missing_vnet_service_endpoint
+                        })
+                except Exception as e:
+                    self.logger.debug(f"Could not get VNet rules for {server.name}: {e}")
                 
                 sub_data['sql_servers'].append(server_info)
             
@@ -1140,15 +1188,35 @@ class AzureDiscovery:
             aks_client = ContainerServiceClient(self.credential, subscription_id)
             clusters = list(aks_client.managed_clusters.list())
             for cluster in clusters:
-                sub_data['aks_clusters'].append({
+                cluster_info = {
                     'name': cluster.name,
                     'id': cluster.id,
                     'location': cluster.location,
                     'resource_group': cluster.id.split('/')[4],
                     'kubernetes_version': cluster.kubernetes_version,
                     'fqdn': cluster.fqdn,
-                    'node_pools': [pool.name for pool in cluster.agent_pool_profiles] if cluster.agent_pool_profiles else []
-                })
+                    'node_pools': [pool.name for pool in cluster.agent_pool_profiles] if cluster.agent_pool_profiles else [],
+                    'vnet': None,
+                    'subnet': None,
+                    'container_registry': None
+                }
+                
+                # Extract VNet information from network profile
+                if cluster.network_profile and cluster.network_profile.vnet_subnet_id:
+                    vnet_subnet_id = cluster.network_profile.vnet_subnet_id
+                    # Parse: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Network/virtualNetworks/{vnet}/subnets/{subnet}
+                    parts = vnet_subnet_id.split('/')
+                    if len(parts) >= 11:
+                        cluster_info['vnet'] = parts[8]
+                        cluster_info['subnet'] = parts[10]
+                
+                # Extract container registry from properties (if using managed identity)
+                # This is a simplified check - actual ACR integration can be more complex
+                if hasattr(cluster, 'addon_profiles') and cluster.addon_profiles:
+                    # Check for ACR addon
+                    pass  # ACR integration is typically through RBAC, not directly visible here
+                
+                sub_data['aks_clusters'].append(cluster_info)
             self.logger.info(f"  ✓ Found {len(clusters)} AKS Clusters")
             self.discovery_data['summary']['aks_clusters'] += len(clusters)
         except Exception as e:
@@ -1340,11 +1408,15 @@ class AzureDiscovery:
         dependencies = []
         
         for sub_id, sub_data in self.discovery_data['subscriptions'].items():
+            self.logger.info(f"\nAnalyzing subscription: {sub_data['name']}")
+            
             # App Service dependencies
-            for app in sub_data['app_services']:
+            app_count = len(sub_data.get('app_services', []))
+            self.logger.info(f"  Analyzing {app_count} App Services...")
+            for app in sub_data.get('app_services', []):
                 # Database dependencies from connection strings
-                for conn_key, conn_info in app['connection_strings'].items():
-                    if 'sql' in conn_info['type'].lower():
+                for conn_key, conn_info in app.get('connection_strings', {}).items():
+                    if 'sql' in conn_info.get('type', '').lower():
                         dependencies.append({
                             'source': app['name'],
                             'source_type': 'App Service',
@@ -1355,7 +1427,7 @@ class AzureDiscovery:
                         })
                 
                 # Storage dependencies
-                for setting_key, setting_value in app['app_settings'].items():
+                for setting_key, setting_value in app.get('app_settings', {}).items():
                     if 'storage' in setting_key.lower() or 'blob' in setting_key.lower():
                         dependencies.append({
                             'source': app['name'],
@@ -1367,20 +1439,113 @@ class AzureDiscovery:
                         })
                 
                 # External API dependencies
-                for ext_dep in app['external_dependencies']:
+                for ext_dep in app.get('external_dependencies', []):
                     dependencies.append({
                         'source': app['name'],
                         'source_type': 'App Service',
                         'target': ext_dep.get('value', ext_dep.get('key')),
                         'target_type': 'External API',
-                        'dependency_type': ext_dep['type'],
+                        'dependency_type': ext_dep.get('type', 'External'),
+                        'subscription': sub_id
+                    })
+                
+                # VNet integration dependencies
+                if app.get('vnet_integration'):
+                    dependencies.append({
+                        'source': app['name'],
+                        'source_type': 'App Service',
+                        'target': app['vnet_integration'],
+                        'target_type': 'Virtual Network',
+                        'dependency_type': 'VNet Integration',
+                        'subscription': sub_id
+                    })
+            
+            # Virtual Machine dependencies
+            vm_count = len(sub_data.get('virtual_machines', []))
+            self.logger.info(f"  Analyzing {vm_count} Virtual Machines...")
+            for vm in sub_data.get('virtual_machines', []):
+                # VM to VNet dependency
+                if vm.get('vnet'):
+                    dependencies.append({
+                        'source': vm['name'],
+                        'source_type': 'Virtual Machine',
+                        'target': vm['vnet'],
+                        'target_type': 'Virtual Network',
+                        'dependency_type': 'Network Connection',
+                        'subscription': sub_id
+                    })
+                
+                # VM to Storage (OS Disk)
+                if vm.get('os_disk', {}).get('storage_account'):
+                    dependencies.append({
+                        'source': vm['name'],
+                        'source_type': 'Virtual Machine',
+                        'target': vm['os_disk']['storage_account'],
+                        'target_type': 'Storage Account',
+                        'dependency_type': 'OS Disk',
+                        'subscription': sub_id
+                    })
+                
+                # VM to Storage (Data Disks)
+                for disk in vm.get('data_disks', []):
+                    if disk.get('storage_account'):
+                        dependencies.append({
+                            'source': vm['name'],
+                            'source_type': 'Virtual Machine',
+                            'target': disk['storage_account'],
+                            'target_type': 'Storage Account',
+                            'dependency_type': 'Data Disk',
+                            'subscription': sub_id
+                        })
+            
+            # SQL Server dependencies
+            sql_count = len(sub_data.get('sql_servers', []))
+            self.logger.info(f"  Analyzing {sql_count} SQL Servers...")
+            for sql_server in sub_data.get('sql_servers', []):
+                # SQL to VNet (if using VNet rules)
+                for vnet_rule in sql_server.get('vnet_rules', []):
+                    if vnet_rule.get('vnet_subnet'):
+                        dependencies.append({
+                            'source': sql_server['name'],
+                            'source_type': 'SQL Server',
+                            'target': vnet_rule['vnet_subnet'],
+                            'target_type': 'Virtual Network Subnet',
+                            'dependency_type': 'VNet Service Endpoint',
+                            'subscription': sub_id
+                        })
+            
+            # AKS Cluster dependencies
+            aks_count = len(sub_data.get('aks_clusters', []))
+            self.logger.info(f"  Analyzing {aks_count} AKS Clusters...")
+            for aks in sub_data.get('aks_clusters', []):
+                # AKS to VNet
+                if aks.get('vnet'):
+                    dependencies.append({
+                        'source': aks['name'],
+                        'source_type': 'AKS Cluster',
+                        'target': aks['vnet'],
+                        'target_type': 'Virtual Network',
+                        'dependency_type': 'Network Plugin',
+                        'subscription': sub_id
+                    })
+                
+                # AKS to Container Registry
+                if aks.get('container_registry'):
+                    dependencies.append({
+                        'source': aks['name'],
+                        'source_type': 'AKS Cluster',
+                        'target': aks['container_registry'],
+                        'target_type': 'Container Registry',
+                        'dependency_type': 'Image Pull',
                         'subscription': sub_id
                     })
             
             # VNet peering dependencies
-            for vnet in sub_data['networks']:
-                for peering in vnet['peerings']:
-                    if peering['remote_vnet']:
+            vnet_count = len(sub_data.get('networks', []))
+            self.logger.info(f"  Analyzing {vnet_count} Virtual Networks...")
+            for vnet in sub_data.get('networks', []):
+                for peering in vnet.get('peerings', []):
+                    if peering.get('remote_vnet'):
                         dependencies.append({
                             'source': vnet['name'],
                             'source_type': 'Virtual Network',
@@ -1389,9 +1554,30 @@ class AzureDiscovery:
                             'dependency_type': 'VNet Peering',
                             'subscription': sub_id
                         })
+                
+                # Subnet to NSG dependencies
+                for subnet in vnet.get('subnets', []):
+                    if subnet.get('nsg'):
+                        nsg_name = subnet['nsg'].split('/')[-1] if '/' in subnet['nsg'] else subnet['nsg']
+                        dependencies.append({
+                            'source': f"{vnet['name']}/{subnet['name']}",
+                            'source_type': 'Subnet',
+                            'target': nsg_name,
+                            'target_type': 'Network Security Group',
+                            'dependency_type': 'Security Rules',
+                            'subscription': sub_id
+                        })
         
         self.discovery_data['dependencies'] = dependencies
-        self.logger.info(f"✓ Identified {len(dependencies)} dependencies")
+        self.logger.info(f"\n✓ Identified {len(dependencies)} total dependencies")
+        
+        if len(dependencies) == 0:
+            self.logger.warning("⚠ No dependencies found!")
+            self.logger.warning("  This could mean:")
+            self.logger.warning("  - Resources don't have explicit dependencies configured")
+            self.logger.warning("  - App Services have no connection strings or app settings")
+            self.logger.warning("  - VNets have no peering configured")
+            self.logger.warning("  - Insufficient permissions to read resource configurations")
         
         return dependencies
     
