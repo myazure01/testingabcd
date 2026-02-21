@@ -810,10 +810,12 @@ class AzureDiscovery:
                     'deployment_slots': [],
                     'tags': app.tags or {}
                 }
-                
+
+                # Define rg_name once outside all try-blocks so subsequent blocks can use it
+                rg_name = app.id.split('/')[4]
+
                 # Get app settings
                 try:
-                    rg_name = app.id.split('/')[4]
                     settings = web_client.web_apps.list_application_settings(rg_name, app.name)
                     if settings and settings.properties:
                         for key, value in settings.properties.items():
@@ -905,39 +907,19 @@ class AzureDiscovery:
             self.logger.error(traceback.format_exc())
     
     def scan_app_service_code(self, web_client, resource_group, app_name, app_info):
-        """Scan App Service source code for dependencies"""
-        self.logger.info(f"    Scanning code for {app_name}...")
+        """Mark App Service code scanning status.
         
-        try:
-            # Get publishing credentials
-            creds = web_client.web_apps.begin_list_publishing_credentials(resource_group, app_name).result()
-            
-            # Use Kudu API to scan for patterns
-            kudu_url = f"https://{app_name}.scm.azurewebsites.net"
-            
-            # Patterns to search for
-            patterns = {
-                'external_apis': r'https?://[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}[^\s\'"]*',
-                'smtp_config': r'smtp[^\s]*',
-                'email_patterns': r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',
-                'scheduler_cron': r'@(hourly|daily|weekly|monthly|\([^\)]+\))',
-                'api_keys': r'(api[_-]?key|apikey)["\']?\s*[:=]\s*["\']([^"\']+)["\']'
-            }
-            
-            # Note: Actual Kudu API calls would require authentication
-            # This is a placeholder for the structure
-            app_info['code_analysis'] = {
-                'scanned': True,
-                'patterns_found': {},
-                'note': 'Code scanning requires Kudu API access with publishing credentials'
-            }
-            
-        except Exception as e:
-            self.logger.warning(f"    Could not scan code for {app_name}: {e}")
-            app_info['code_analysis'] = {
-                'scanned': False,
-                'error': str(e)
-            }
+        Full Kudu-based code scanning requires publishing credentials and is
+        performed separately via scan_git_repositories() when git_repos are
+        configured. This method only records the metadata.
+        """
+        app_info['code_analysis'] = {
+            'scanned': False,
+            'note': (
+                'App Service code scanning via Kudu requires configuring git_repos '
+                'or azure_devops in config.json. See README.md for instructions.'
+            )
+        }
     
     def discover_sql_databases(self, sql_client, sub_data):
         """Discover SQL Databases"""
@@ -1868,94 +1850,99 @@ class AzureDiscovery:
         return app_dependencies
     
     def _clone_repo_with_ssl_fallback(self, repo_url: str, repo_path: str, repo_branch=None):
-        """Clone or pull a git repo, retrying with SSL verification disabled on SSL errors."""
+        """Clone or pull a git repo, retrying with SSL verification disabled on SSL errors.
+        
+        NOTE: git.Repo.clone_from does NOT accept an 'env' kwarg for subprocess env vars.
+        The correct approach is git.cmd.Git().custom_environment() context manager or
+        temporarily patching os.environ before the call.
+        """
         import urllib.parse
 
-        # Mask credentials for logging
+        # Mask credentials in log output
         try:
-            parsed = urllib.parse.urlparse(repo_url)
+            parsed   = urllib.parse.urlparse(repo_url)
             safe_url = repo_url.replace(parsed.password or '', '***') if parsed.password else repo_url
         except Exception:
             safe_url = repo_url
 
-        def do_clone(env=None):
-            kwargs = {}
-            if repo_branch:
-                kwargs['branch'] = repo_branch
-            if env:
-                kwargs['env'] = env
-            return git.Repo.clone_from(repo_url, repo_path, **kwargs)
+        clone_kwargs = {}
+        if repo_branch:
+            clone_kwargs['branch'] = repo_branch
 
-        def do_pull(repo_obj, env=None):
+        def _do_clone_normal():
+            git.Repo.clone_from(repo_url, repo_path, **clone_kwargs)
+
+        def _do_clone_ssl_bypass():
+            """Use git custom_environment context manager – the correct GitPython way."""
+            with git.cmd.Git().custom_environment(GIT_SSL_NO_VERIFY='1'):
+                git.Repo.clone_from(repo_url, repo_path, **clone_kwargs)
+
+        def _do_pull_normal(repo_obj):
             origin = repo_obj.remotes.origin
-            if env:
-                with repo_obj.git.custom_environment(**env):
-                    if repo_branch:
-                        if repo_branch in [h.name for h in repo_obj.heads]:
-                            repo_obj.heads[repo_branch].checkout()
-                        origin.pull(repo_branch)
-                    else:
-                        origin.pull()
+            if repo_branch:
+                branch_names = [h.name for h in repo_obj.heads]
+                if repo_branch in branch_names:
+                    repo_obj.heads[repo_branch].checkout()
+                origin.pull(repo_branch)
             else:
-                if repo_branch:
-                    if repo_branch in [h.name for h in repo_obj.heads]:
-                        repo_obj.heads[repo_branch].checkout()
-                    origin.pull(repo_branch)
-                else:
-                    origin.pull()
+                origin.pull()
+
+        def _do_pull_ssl_bypass(repo_obj):
+            with repo_obj.git.custom_environment(GIT_SSL_NO_VERIFY='1'):
+                _do_pull_normal(repo_obj)
+
+        def _is_ssl_error(err):
+            s = str(err).lower()
+            return 'ssl' in s or 'certificate' in s or 'cert' in s
 
         if os.path.exists(repo_path):
-            # Already cloned – just pull
+            # Repo already cloned: just pull latest
             try:
                 repo_obj = git.Repo(repo_path)
-                do_pull(repo_obj)
-                self.logger.info(f"  ✓ Updated (pulled) existing repo")
+                _do_pull_normal(repo_obj)
+                self.logger.info(f"  ✓ Updated existing repo (pull)")
                 return repo_path
-            except git.exc.GitCommandError as e:
-                if 'ssl' in str(e).lower() or 'certificate' in str(e).lower():
-                    self.logger.warning(f"  ⚠ SSL error on pull — retrying with SSL verification disabled")
-                    self.logger.warning(f"    Fix: git config --global http.sslBackend schannel")
-                    repo_obj = git.Repo(repo_path)
-                    ssl_env = {**os.environ.copy(), 'GIT_SSL_NO_VERIFY': '1'}
-                    do_pull(repo_obj, env={'GIT_SSL_NO_VERIFY': '1'})
+            except git.exc.GitCommandError as pull_err:
+                if _is_ssl_error(pull_err):
+                    self.logger.warning(f"  ⚠ SSL error on pull — retrying with SSL verification bypassed")
+                    self.logger.warning(f"    Permanent fix: git config --global http.sslBackend schannel")
+                    _do_pull_ssl_bypass(repo_obj)
+                    self.logger.info(f"  ✓ Pull succeeded (SSL bypassed)")
                     return repo_path
                 raise
         else:
-            # First clone attempt (normal)
+            # First clone
             try:
-                do_clone()
+                _do_clone_normal()
                 self.logger.info(f"  ✓ Cloned successfully")
                 return repo_path
-            except git.exc.GitCommandError as e:
-                err_str = str(e).lower()
-                if 'ssl' in err_str or 'certificate' in err_str:
+            except git.exc.GitCommandError as clone_err:
+                err_str = str(clone_err).lower()
+                if _is_ssl_error(clone_err):
                     self.logger.warning(f"  ⚠ SSL error cloning {safe_url}")
-                    self.logger.warning(f"  ⚠ Retrying with GIT_SSL_NO_VERIFY=1 (SSL verification bypassed)")
+                    self.logger.warning(f"  ⚠ Retrying with GIT_SSL_NO_VERIFY=1")
                     self.logger.warning(f"  💡 Permanent fix options:")
                     self.logger.warning(f"     1. git config --global http.sslBackend schannel  (Windows cert store)")
-                    self.logger.warning(f"     2. git config --global http.sslVerify false       (disable SSL - less secure)")
-                    self.logger.warning(f"     3. git config --global http.sslCAInfo /path/to/cert.crt")
-                    # Retry without SSL verification using env variable
-                    ssl_env = os.environ.copy()
-                    ssl_env['GIT_SSL_NO_VERIFY'] = '1'
+                    self.logger.warning(f"     2. git config --global http.sslVerify false       (less secure)")
+                    self.logger.warning(f"     3. git config --global http.sslCAInfo C:\\path\\to\\ca.crt")
                     try:
-                        do_clone(env=ssl_env)
+                        _do_clone_ssl_bypass()
                         self.logger.info(f"  ✓ Cloned successfully (SSL verification bypassed)")
                         return repo_path
-                    except Exception as e2:
-                        self.logger.error(f"  ✗ Clone failed even with SSL bypass: {e2}")
+                    except Exception as retry_err:
+                        self.logger.error(f"  ✗ Clone failed even with SSL bypass: {retry_err}")
                         raise
                 elif '401' in err_str or '403' in err_str or 'authentication' in err_str:
                     self.logger.error(f"  ✗ Authentication failed for {safe_url}")
-                    self.logger.error(f"  💡 Check your PAT token in config.json has 'Code (Read)' permission")
-                    self.logger.error(f"  💡 Azure DevOps PAT: User Settings → Personal Access Tokens → Code (Read)")
+                    self.logger.error(f"  💡 Check PAT token has 'Code (Read)' permission")
+                    self.logger.error(f"  💡 Azure DevOps: User Settings → Personal Access Tokens → Code (Read)")
                     raise
                 elif 'not found' in err_str or '404' in err_str:
                     self.logger.error(f"  ✗ Repository not found: {safe_url}")
                     self.logger.error(f"  💡 Check organization/project/repository names in config.json")
                     raise
                 else:
-                    self.logger.error(f"  ✗ Git error: {e}")
+                    self.logger.error(f"  ✗ Git error cloning {safe_url}: {clone_err}")
                     raise
 
     def scan_git_repositories(self):
