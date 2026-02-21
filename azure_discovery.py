@@ -4539,6 +4539,17 @@ def self_update():
         commits_behind = list(repo.iter_commits(f"{local_commit.hexsha}..{remote_commit.hexsha}"))
         print(f"   ⬇  {len(commits_behind)} new commit(s) available – pulling...")
 
+        # Preserve config.json across the pull – it contains user-specific settings
+        # (subscription IDs, PAT tokens, etc.) that must never be overwritten by remote
+        config_path = os.path.join(script_dir, 'config.json')
+        config_backup = None
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r', encoding='utf-8') as _cf:
+                    config_backup = _cf.read()
+            except Exception:
+                config_backup = None
+
         # Pull with SSL fallback
         def _pull(ssl_bypass=False):
             if ssl_bypass:
@@ -4556,6 +4567,15 @@ def self_update():
                 _pull(ssl_bypass=True)
             else:
                 raise
+
+        # Restore config.json to the user's pre-pull version
+        if config_backup is not None:
+            try:
+                with open(config_path, 'w', encoding='utf-8') as _cf:
+                    _cf.write(config_backup)
+                print("   ✓  config.json preserved (local subscription settings kept)")
+            except Exception as re:
+                print(f"   ⚠  Could not restore config.json: {re}")
 
         # Show what changed
         changed_files = [
