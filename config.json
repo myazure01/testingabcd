@@ -27,17 +27,10 @@
         "pat_token": "YOUR_PERSONAL_ACCESS_TOKEN",
         "projects": [
             {
-                "project_name": "PROJECT1",
+                "project_name": "YOUR_PROJECT_NAME",
                 "repositories": [
-                    {"name": "repo1", "branch": "main"},
-                    {"name": "repo2", "branch": "develop"}
-                ]
-            },
-            {
-                "project_name": "PROJECT2",
-                "repositories": [
-                    {"name": "webapp", "branch": "main"},
-                    {"name": "api", "branch": "release"}
+                    {"name": "YOUR_REPO1", "branch": "main"},
+                    {"name": "YOUR_REPO2", "branch": "develop"}
                 ]
             }
         ]

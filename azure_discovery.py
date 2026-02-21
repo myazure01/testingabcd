@@ -162,6 +162,13 @@ class AzureDiscovery:
             if not project_name or 'YOUR_' in str(project_name):
                 print(f"  ⚠ Skipping project with placeholder or empty name: '{project_name}'")
                 continue
+
+            # Skip entries that look like unedited template placeholders
+            # (all-uppercase names like PROJECT1, PROJECT2, MYPROJECT)
+            import re as _re
+            if _re.fullmatch(r'[A-Z][A-Z0-9_]*', str(project_name)):
+                print(f"  ⚠ Skipping project with placeholder-like name: '{project_name}' (update config.json with real project name)")
+                continue
             
             for repo in repositories:
                 if isinstance(repo, dict):
@@ -172,6 +179,13 @@ class AzureDiscovery:
                     repo_branch = None
                 
                 if not repo_name or 'YOUR_' in str(repo_name):
+                    continue
+                
+                # Skip entries that look like unedited template placeholders
+                # (all-uppercase words with no spaces, e.g. PROJECT2, REPO1, WEBAPP)
+                import re as _re
+                if _re.fullmatch(r'[A-Z][A-Z0-9_]*', str(repo_name)):
+                    print(f"  ⚠ Skipping repo with placeholder-like name: '{repo_name}' (update config.json)")
                     continue
                 
                 # URL-encode PAT token to handle special characters (=, +, /, etc.)
