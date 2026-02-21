@@ -399,11 +399,112 @@ Discovery/
 
 ## 📞 Support
 
-For issues or questions:
-1. Check `START_HERE.txt` for quick solutions
-2. Open `QUICK_START_GUIDE.html` in browser
-3. Review sample reports in `discovery_output\`
+For issues or questions, check the troubleshooting sections below or review discovery logs in `discovery_output\`.
 
-## 📝 License
+---
+
+## 🔒 SSL Certificate Errors (Git Clone / Repo Scanning)
+
+If repo scanning fails with SSL errors like:
+```
+ssl.SSLError: [SSL: CERTIFICATE_VERIFY_FAILED]
+fatal: unable to access '...': SSL certificate problem: unable to get local issuer certificate
+```
+
+The tool will **automatically retry** with SSL bypassed and log instructions. For a permanent fix:
+
+### ✅ Fix 1: Use Windows Certificate Store (Recommended for corporate environments)
+```bash
+git config --global http.sslBackend schannel
+```
+
+### ✅ Fix 2: Set Custom CA Certificate
+```bash
+git config --global http.sslCAInfo "C:\path\to\your-company-ca.crt"
+```
+
+### ✅ Fix 3: Disable SSL Verification (Quick fix — less secure)
+```bash
+git config --global http.sslVerify false
+```
+Re-enable after cloning:
+```bash
+git config --global http.sslVerify true
+```
+
+### ✅ Fix 4: Corporate Proxy with SSL Inspection
+```bash
+git config --global http.proxy http://proxy.company.com:8080
+git config --global http.sslBackend schannel
+```
+
+### Reset All Git SSL Settings
+```bash
+git config --global --unset http.sslVerify
+git config --global --unset http.sslCAInfo
+git config --global --unset http.sslBackend
+git config --global --unset http.proxy
+```
+
+---
+
+## 📁 Code Repository Scanning
+
+The tool can scan Azure DevOps or any Git repository for dependencies (connection strings, Azure SDK usage, ARM templates, NuGet packages).
+
+### Configure Azure DevOps Repositories
+
+Edit `config.json`:
+```json
+{
+    "scan_code": true,
+    "azure_devops": {
+        "organization": "your-org-name",
+        "pat_token": "your-personal-access-token",
+        "projects": [
+            {
+                "project_name": "MyProject",
+                "repositories": [
+                    { "name": "my-api",      "branch": "main" },
+                    { "name": "my-frontend", "branch": "develop" }
+                ]
+            }
+        ]
+    }
+}
+```
+
+**Create a PAT token:**
+1. Azure DevOps → User Settings (top right) → Personal Access Tokens
+2. New Token → Scopes: **Code (Read)**
+3. Copy token → paste into `pat_token` in `config.json`
+
+### Configure Any Git Repository (GitHub, Bitbucket, etc.)
+
+```json
+{
+    "scan_code": true,
+    "git_repos": [
+        { "url": "https://github.com/org/repo.git",       "branch": "main" },
+        { "url": "https://user:token@github.com/org/repo", "branch": "develop" },
+        { "url": "https://pat:TOKEN@dev.azure.com/org/proj/_git/repo", "branch": "main" }
+    ]
+}
+```
+
+### Troubleshooting: "No code repositories scanned"
+
+Run the tool and check the log output for the **"Scanning Git Repositories"** section. It will show:
+
+| Message | Cause | Fix |
+|---|---|---|
+| `azure_devops organization/pat_token is empty` | Config not set | Fill `azure_devops` in `config.json` |
+| `still contain placeholder values (YOUR_...)` | Config not updated | Replace `YOUR_ORG_NAME` etc. in `config.json` |
+| `Authentication failed` | Invalid PAT token | Regenerate PAT with Code (Read) scope |
+| `Repository not found` | Wrong names | Verify org/project/repo names in Azure DevOps |
+| `SSL error` | Certificate issue | See SSL fixes above |
+| `0 repo(s) configured` | `git_repos` empty | Add repos via `azure_devops` or `git_repos` in `config.json` |
+
+---
 
 See LICENSE.txt for details.
