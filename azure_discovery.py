@@ -4266,8 +4266,157 @@ class AzureDiscovery:
             }
 
 
+def self_update():
+    """Auto-sync this tool's own git repository before running.
+    
+    Pulls the latest code from the remote (origin) so every run
+    always uses the most up-to-date version of the scripts.
+    
+    Behaviour:
+    - If the folder is not a git repo, or git is not installed: skips silently.
+    - If there are local uncommitted changes: skips to avoid overwriting user edits.
+    - If pull succeeds and files changed: prints a restart notice.
+    - Network errors (no internet, auth failure): warns and continues.
+    """
+    print("\n🔄 Checking for tool updates...")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    try:
+        repo = git.Repo(script_dir, search_parent_directories=True)
+    except git.exc.InvalidGitRepositoryError:
+        print("   ℹ  Not a git repository – skipping auto-update")
+        return
+    except Exception as e:
+        print(f"   ⚠  Could not open git repo: {e} – skipping auto-update")
+        return
+
+    # Safety: don't overwrite local uncommitted changes
+    if repo.is_dirty(untracked_files=False):
+        print("   ⚠  Local uncommitted changes detected – skipping auto-update to avoid overwriting")
+        print("      Commit or stash your changes to enable auto-update.")
+        return
+
+    # Check remote exists
+    if not repo.remotes:
+        print("   ℹ  No git remote configured – skipping auto-update")
+        return
+
+    origin = repo.remotes.origin
+    remote_url = origin.url
+
+    # Mask credentials in URL for display
+    try:
+        import urllib.parse
+        parsed = urllib.parse.urlparse(remote_url)
+        display_url = remote_url.replace(parsed.password or '', '***') if parsed.password else remote_url
+    except Exception:
+        display_url = remote_url
+
+    try:
+        current_branch = repo.active_branch.name
+    except TypeError:
+        # Detached HEAD state
+        print("   ⚠  Detached HEAD state – skipping auto-update")
+        return
+
+    print(f"   Remote : {display_url}")
+    print(f"   Branch : {current_branch}")
+
+    try:
+        # Fetch first to check if there are updates, with SSL fallback
+        def _fetch(ssl_bypass=False):
+            if ssl_bypass:
+                with repo.git.custom_environment(GIT_SSL_NO_VERIFY='1'):
+                    origin.fetch()
+            else:
+                origin.fetch()
+
+        try:
+            _fetch(ssl_bypass=False)
+        except git.exc.GitCommandError as fe:
+            s = str(fe).lower()
+            if 'ssl' in s or 'certificate' in s:
+                print("   ⚠  SSL error on fetch – retrying with SSL verification bypassed")
+                print("      Permanent fix: git config --global http.sslBackend schannel")
+                _fetch(ssl_bypass=True)
+            elif '401' in s or '403' in s or 'authentication' in s:
+                print("   ⚠  Authentication error fetching updates – skipping auto-update")
+                return
+            else:
+                raise
+
+        # Compare local HEAD with remote tracking branch
+        tracking = f"origin/{current_branch}"
+        try:
+            remote_commit = repo.commit(tracking)
+        except git.exc.BadName:
+            print(f"   ⚠  Remote branch '{tracking}' not found – skipping auto-update")
+            return
+
+        local_commit  = repo.head.commit
+        if local_commit.hexsha == remote_commit.hexsha:
+            print("   ✓  Already up to date")
+            return
+
+        # Count commits behind
+        commits_behind = list(repo.iter_commits(f"{local_commit.hexsha}..{remote_commit.hexsha}"))
+        print(f"   ⬇  {len(commits_behind)} new commit(s) available – pulling...")
+
+        # Pull with SSL fallback
+        def _pull(ssl_bypass=False):
+            if ssl_bypass:
+                with repo.git.custom_environment(GIT_SSL_NO_VERIFY='1'):
+                    origin.pull(current_branch)
+            else:
+                origin.pull(current_branch)
+
+        try:
+            _pull(ssl_bypass=False)
+        except git.exc.GitCommandError as pe:
+            s = str(pe).lower()
+            if 'ssl' in s or 'certificate' in s:
+                print("   ⚠  SSL error on pull – retrying with SSL verification bypassed")
+                _pull(ssl_bypass=True)
+            else:
+                raise
+
+        # Show what changed
+        changed_files = [
+            item.a_path
+            for item in repo.index.diff(local_commit)
+        ]
+        print(f"   ✓  Updated successfully! Files changed:")
+        for f in changed_files[:10]:   # cap display at 10
+            print(f"      • {f}")
+        if len(changed_files) > 10:
+            print(f"      ... and {len(changed_files) - 10} more")
+
+        # If this script itself was updated, warn user to restart
+        this_script = os.path.basename(__file__)
+        if any(this_script in f or 'azure_discovery' in f for f in changed_files):
+            print()
+            print("   ⚠  " + "="*60)
+            print("   ⚠  azure_discovery.py was updated.")
+            print("   ⚠  Please re-run the script to use the latest version.")
+            print("   ⚠  " + "="*60)
+            print()
+            sys.exit(0)   # Exit cleanly so the user runs the updated version
+
+    except git.exc.GitCommandError as e:
+        print(f"   ⚠  Git pull failed: {e}")
+        print("      Continuing with current version...")
+    except Exception as e:
+        print(f"   ⚠  Auto-update error: {e}")
+        print("      Continuing with current version...")
+
+    print()
+
+
 def main():
     """Main entry point"""
+    # Auto-sync before anything else
+    self_update()
+
     print("""
 ╔═══════════════════════════════════════════════════════════════════════════════╗
 ║                     AZURE DISCOVERY TOOL FOR MIGRATION                        ║
