@@ -22,7 +22,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Dict, List, Any, Set
-from collections import defaultdict
+from collections import defaultdict, Counter
 import traceback
 
 # Azure SDK imports
@@ -1400,7 +1400,26 @@ class AzureDiscovery:
         self.logger.info("✓ PaaS services discovery complete")
     
     def analyze_dependencies(self):
-        """Analyze and map dependencies between resources"""
+        """Analyze and map dependencies between resources.
+        
+        Detects service-to-service connections by:
+        1. Building lookup maps of discovered Azure resources (indexed by hostname/endpoint)
+        2. Scanning App Service / Function App settings values for Azure service endpoints
+        3. Matching found endpoints against actual resource names in the same subscription
+        
+        Detected connection types:
+        - App Service / Function → Service Bus (Endpoint=sb://...servicebus.windows.net)
+        - App Service / Function → Event Hub   (EntityPath= in connection string)
+        - App Service / Function → Cosmos DB   (AccountEndpoint=https://...documents.azure.com)
+        - App Service / Function → Redis Cache (...redis.cache.windows.net)
+        - App Service / Function → Key Vault   (@Microsoft.KeyVault(...) or ...vault.azure.net)
+        - App Service / Function → SQL Server  (...database.windows.net)
+        - App Service / Function → Storage     (AccountName= or ...blob.core.windows.net)
+        - App Service / Function → App Insights (APPINSIGHTS_* keys)
+        - VM → VNet / Storage (disk)
+        - AKS → VNet / Container Registry
+        - VNet → VNet (peering), Subnet → NSG
+        """
         self.logger.info("\n" + "="*80)
         self.logger.info("Analyzing Dependencies")
         self.logger.info("="*80)
@@ -1410,176 +1429,334 @@ class AzureDiscovery:
         for sub_id, sub_data in self.discovery_data['subscriptions'].items():
             self.logger.info(f"\nAnalyzing subscription: {sub_data['name']}")
             
-            # App Service dependencies
+            # ----------------------------------------------------------------
+            # Build lookup maps: resource name (lower) → display name
+            # Used to resolve hostnames found in app settings to real names
+            # ----------------------------------------------------------------
+            sb_lookup      = {r['name'].lower(): r['name'] for r in sub_data.get('service_bus', [])}
+            eh_lookup      = {r['name'].lower(): r['name'] for r in sub_data.get('event_hubs', [])}
+            cosmos_lookup  = {r['name'].lower(): r['name'] for r in sub_data.get('cosmos_db', [])}
+            redis_lookup   = {r['name'].lower(): r['name'] for r in sub_data.get('redis_cache', [])}
+            kv_lookup      = {r['name'].lower(): r['name'] for r in sub_data.get('key_vaults', [])}
+            storage_lookup = {r['name'].lower(): r['name'] for r in sub_data.get('storage_accounts', [])}
+            ai_lookup      = {r['name'].lower(): r['name'] for r in sub_data.get('app_insights', [])}
+            # SQL indexed by server name
+            sql_lookup = {}
+            for srv in sub_data.get('sql_servers', []):
+                sql_lookup[srv['name'].lower()] = srv['name']
+            
+            self.logger.info(
+                f"  Lookup maps built: {len(sb_lookup)} SB, {len(eh_lookup)} EH, "
+                f"{len(cosmos_lookup)} CosmosDB, {len(redis_lookup)} Redis, "
+                f"{len(kv_lookup)} KeyVaults, {len(sql_lookup)} SQL, "
+                f"{len(storage_lookup)} Storage, {len(ai_lookup)} AppInsights"
+            )
+            
+            # ----------------------------------------------------------------
+            # App Service / Function App → Azure Service dependencies
+            # ----------------------------------------------------------------
             app_count = len(sub_data.get('app_services', []))
-            self.logger.info(f"  Analyzing {app_count} App Services...")
+            self.logger.info(f"  Analyzing {app_count} App Services / Functions...")
+            
             for app in sub_data.get('app_services', []):
-                # Database dependencies from connection strings
+                is_function  = 'functionapp' in str(app.get('kind', '')).lower()
+                source_type  = 'Azure Function' if is_function else 'App Service'
+                app_name     = app['name']
+                all_settings = app.get('app_settings', {})
+                
+                for setting_key, setting_value in all_settings.items():
+                    val = str(setting_value)
+                    if not val or val == '***MASKED***':
+                        continue
+                    
+                    # ---- Service Bus ----
+                    # Endpoint=sb://{ns}.servicebus.windows.net/ OR {ns}.servicebus.windows.net
+                    sb_match = re.search(
+                        r'(?:Endpoint=sb://|^)([a-zA-Z0-9\-]+)\.servicebus\.windows\.net',
+                        val, re.IGNORECASE
+                    )
+                    if sb_match and 'servicebus.windows.net' in val.lower():
+                        ns_name = sb_match.group(1)
+                        # Differentiate Event Hub vs Service Bus by EntityPath=
+                        if 'entitypath=' in val.lower():
+                            ep_match = re.search(r'EntityPath=([^;\s]+)', val, re.IGNORECASE)
+                            eh_entity = f"/{ep_match.group(1)}" if ep_match else ''
+                            target = eh_lookup.get(ns_name.lower(), ns_name) + eh_entity
+                            target_type = 'Event Hub'
+                            dep_type = 'Event Hub Connection'
+                        else:
+                            target = sb_lookup.get(ns_name.lower(), ns_name)
+                            target_type = 'Service Bus'
+                            dep_type = 'Service Bus Connection'
+                        dependencies.append({
+                            'source': app_name, 'source_type': source_type,
+                            'target': target, 'target_type': target_type,
+                            'dependency_type': dep_type, 'setting_key': setting_key,
+                            'subscription': sub_id
+                        })
+                        continue  # already classified this setting
+                    
+                    # ---- Cosmos DB ----
+                    cosmos_match = re.search(
+                        r'AccountEndpoint=https://([a-zA-Z0-9\-]+)\.documents\.azure\.com'
+                        r'|([a-zA-Z0-9\-]+)\.(?:documents|mongo\.cosmos|table\.cosmos|cassandra\.cosmos)\.azure\.com',
+                        val, re.IGNORECASE
+                    )
+                    if cosmos_match:
+                        acct = cosmos_match.group(1) or cosmos_match.group(2)
+                        target = cosmos_lookup.get(acct.lower(), acct)
+                        dependencies.append({
+                            'source': app_name, 'source_type': source_type,
+                            'target': target, 'target_type': 'Cosmos DB',
+                            'dependency_type': 'Cosmos DB Connection', 'setting_key': setting_key,
+                            'subscription': sub_id
+                        })
+                        continue
+                    
+                    # ---- Redis Cache ----
+                    redis_match = re.search(
+                        r'([a-zA-Z0-9\-]+)\.redis\.cache\.windows\.net', val, re.IGNORECASE
+                    )
+                    if redis_match:
+                        target = redis_lookup.get(redis_match.group(1).lower(), redis_match.group(1))
+                        dependencies.append({
+                            'source': app_name, 'source_type': source_type,
+                            'target': target, 'target_type': 'Redis Cache',
+                            'dependency_type': 'Redis Connection', 'setting_key': setting_key,
+                            'subscription': sub_id
+                        })
+                        continue
+                    
+                    # ---- Key Vault Reference ----
+                    # @Microsoft.KeyVault(VaultName=...) OR @Microsoft.KeyVault(SecretUri=https://...vault.azure.net/...)
+                    kv_match = re.search(
+                        r'@Microsoft\.KeyVault\((?:VaultName=([a-zA-Z0-9\-]+)|SecretUri=https://([a-zA-Z0-9\-]+)\.vault\.azure\.net)'
+                        r'|([a-zA-Z0-9\-]+)\.vault\.azure\.net',
+                        val, re.IGNORECASE
+                    )
+                    if kv_match:
+                        kv_name = kv_match.group(1) or kv_match.group(2) or kv_match.group(3)
+                        if kv_name:
+                            target = kv_lookup.get(kv_name.lower(), kv_name)
+                            dependencies.append({
+                                'source': app_name, 'source_type': source_type,
+                                'target': target, 'target_type': 'Key Vault',
+                                'dependency_type': 'Key Vault Reference', 'setting_key': setting_key,
+                                'subscription': sub_id
+                            })
+                        continue
+                    
+                    # ---- SQL Server ----
+                    sql_match = re.search(
+                        r'([a-zA-Z0-9\-]+)\.database\.windows\.net', val, re.IGNORECASE
+                    )
+                    if sql_match:
+                        srv_name = sql_match.group(1)
+                        target = sql_lookup.get(srv_name.lower(), srv_name)
+                        dependencies.append({
+                            'source': app_name, 'source_type': source_type,
+                            'target': target, 'target_type': 'SQL Server',
+                            'dependency_type': 'SQL Connection', 'setting_key': setting_key,
+                            'subscription': sub_id
+                        })
+                        continue
+                    
+                    # ---- Storage Account ----
+                    sa_match = (
+                        re.search(r'AccountName=([a-zA-Z0-9]+)', val, re.IGNORECASE) or
+                        re.search(r'([a-zA-Z0-9]+)\.(?:blob|table|queue|file)\.core\.windows\.net', val, re.IGNORECASE)
+                    )
+                    if sa_match:
+                        sa_name = sa_match.group(1)
+                        target = storage_lookup.get(sa_name.lower(), sa_name)
+                        dependencies.append({
+                            'source': app_name, 'source_type': source_type,
+                            'target': target, 'target_type': 'Storage Account',
+                            'dependency_type': 'Storage Connection', 'setting_key': setting_key,
+                            'subscription': sub_id
+                        })
+                        continue
+                
+                # ---- Application Insights (by key name, value may be masked) ----
+                for setting_key in all_settings:
+                    if setting_key.upper() in (
+                        'APPINSIGHTS_INSTRUMENTATIONKEY',
+                        'APPLICATIONINSIGHTS_CONNECTION_STRING',
+                        'APPINSIGHTS_PROFILERFEATURE_VERSION',
+                        'APPINSIGHTS_SNAPSHOTFEATURE_VERSION',
+                    ):
+                        # Try to match to a discovered AI component in the same subscription
+                        # (we can't match by key value since it may be masked)
+                        if len(ai_lookup) == 1:
+                            target = next(iter(ai_lookup.values()))
+                        elif len(ai_lookup) > 1:
+                            # Find component whose name appears in the app name
+                            matched = next(
+                                (name for key, name in ai_lookup.items() if key in app_name.lower()),
+                                'Application Insights'
+                            )
+                            target = matched
+                        else:
+                            target = 'Application Insights'
+                        dependencies.append({
+                            'source': app_name, 'source_type': source_type,
+                            'target': target, 'target_type': 'Application Insights',
+                            'dependency_type': 'Monitoring (App Insights)', 'setting_key': setting_key,
+                            'subscription': sub_id
+                        })
+                        break
+                
+                # ---- Connection Strings (SQL from type field) ----
                 for conn_key, conn_info in app.get('connection_strings', {}).items():
-                    if 'sql' in conn_info.get('type', '').lower():
+                    conn_type = conn_info.get('type', '').lower() if isinstance(conn_info, dict) else ''
+                    if conn_type in ('sqlazure', 'sqlserver', 'sql'):
+                        # Try to match conn_key name against sql_lookup
+                        matched_sql = next(
+                            (name for key, name in sql_lookup.items() if key in conn_key.lower() or conn_key.lower() in key),
+                            conn_key
+                        )
                         dependencies.append({
-                            'source': app['name'],
-                            'source_type': 'App Service',
-                            'target': conn_key,
-                            'target_type': 'SQL Database',
-                            'dependency_type': 'Connection String',
+                            'source': app_name, 'source_type': source_type,
+                            'target': matched_sql, 'target_type': 'SQL Database',
+                            'dependency_type': 'Connection String (SQL)', 'setting_key': conn_key,
+                            'subscription': sub_id
+                        })
+                    elif conn_key and conn_type not in ('', 'custom'):
+                        dependencies.append({
+                            'source': app_name, 'source_type': source_type,
+                            'target': conn_key, 'target_type': f'Database ({conn_type})',
+                            'dependency_type': 'Connection String', 'setting_key': conn_key,
                             'subscription': sub_id
                         })
                 
-                # Storage dependencies
-                for setting_key, setting_value in app.get('app_settings', {}).items():
-                    if 'storage' in setting_key.lower() or 'blob' in setting_key.lower():
-                        dependencies.append({
-                            'source': app['name'],
-                            'source_type': 'App Service',
-                            'target': str(setting_value),
-                            'target_type': 'Storage Account',
-                            'dependency_type': 'App Setting',
-                            'subscription': sub_id
-                        })
-                
-                # External API dependencies
-                for ext_dep in app.get('external_dependencies', []):
-                    dependencies.append({
-                        'source': app['name'],
-                        'source_type': 'App Service',
-                        'target': ext_dep.get('value', ext_dep.get('key')),
-                        'target_type': 'External API',
-                        'dependency_type': ext_dep.get('type', 'External'),
-                        'subscription': sub_id
-                    })
-                
-                # VNet integration dependencies
+                # ---- VNet Integration ----
                 if app.get('vnet_integration'):
                     dependencies.append({
-                        'source': app['name'],
-                        'source_type': 'App Service',
-                        'target': app['vnet_integration'],
-                        'target_type': 'Virtual Network',
+                        'source': app_name, 'source_type': source_type,
+                        'target': app['vnet_integration'], 'target_type': 'Virtual Network',
                         'dependency_type': 'VNet Integration',
                         'subscription': sub_id
                     })
+                
+                # ---- External API dependencies ----
+                for ext_dep in app.get('external_dependencies', []):
+                    ext_target = ext_dep.get('value', ext_dep.get('key'))
+                    if ext_target and ext_target != '***MASKED***':
+                        dependencies.append({
+                            'source': app_name, 'source_type': source_type,
+                            'target': ext_target, 'target_type': 'External API',
+                            'dependency_type': ext_dep.get('type', 'External'),
+                            'subscription': sub_id
+                        })
             
+            # ----------------------------------------------------------------
             # Virtual Machine dependencies
+            # ----------------------------------------------------------------
             vm_count = len(sub_data.get('virtual_machines', []))
             self.logger.info(f"  Analyzing {vm_count} Virtual Machines...")
             for vm in sub_data.get('virtual_machines', []):
-                # VM to VNet dependency
                 if vm.get('vnet'):
                     dependencies.append({
-                        'source': vm['name'],
-                        'source_type': 'Virtual Machine',
-                        'target': vm['vnet'],
-                        'target_type': 'Virtual Network',
-                        'dependency_type': 'Network Connection',
-                        'subscription': sub_id
+                        'source': vm['name'], 'source_type': 'Virtual Machine',
+                        'target': vm['vnet'], 'target_type': 'Virtual Network',
+                        'dependency_type': 'Network Connection', 'subscription': sub_id
                     })
-                
-                # VM to Storage (OS Disk)
                 if vm.get('os_disk', {}).get('storage_account'):
                     dependencies.append({
-                        'source': vm['name'],
-                        'source_type': 'Virtual Machine',
-                        'target': vm['os_disk']['storage_account'],
-                        'target_type': 'Storage Account',
-                        'dependency_type': 'OS Disk',
-                        'subscription': sub_id
+                        'source': vm['name'], 'source_type': 'Virtual Machine',
+                        'target': vm['os_disk']['storage_account'], 'target_type': 'Storage Account',
+                        'dependency_type': 'OS Disk', 'subscription': sub_id
                     })
-                
-                # VM to Storage (Data Disks)
                 for disk in vm.get('data_disks', []):
                     if disk.get('storage_account'):
                         dependencies.append({
-                            'source': vm['name'],
-                            'source_type': 'Virtual Machine',
-                            'target': disk['storage_account'],
-                            'target_type': 'Storage Account',
-                            'dependency_type': 'Data Disk',
-                            'subscription': sub_id
+                            'source': vm['name'], 'source_type': 'Virtual Machine',
+                            'target': disk['storage_account'], 'target_type': 'Storage Account',
+                            'dependency_type': 'Data Disk', 'subscription': sub_id
                         })
             
+            # ----------------------------------------------------------------
             # SQL Server dependencies
+            # ----------------------------------------------------------------
             sql_count = len(sub_data.get('sql_servers', []))
             self.logger.info(f"  Analyzing {sql_count} SQL Servers...")
             for sql_server in sub_data.get('sql_servers', []):
-                # SQL to VNet (if using VNet rules)
                 for vnet_rule in sql_server.get('vnet_rules', []):
                     if vnet_rule.get('vnet_subnet'):
                         dependencies.append({
-                            'source': sql_server['name'],
-                            'source_type': 'SQL Server',
-                            'target': vnet_rule['vnet_subnet'],
-                            'target_type': 'Virtual Network Subnet',
-                            'dependency_type': 'VNet Service Endpoint',
-                            'subscription': sub_id
+                            'source': sql_server['name'], 'source_type': 'SQL Server',
+                            'target': vnet_rule['vnet_subnet'], 'target_type': 'Virtual Network Subnet',
+                            'dependency_type': 'VNet Service Endpoint', 'subscription': sub_id
                         })
             
+            # ----------------------------------------------------------------
             # AKS Cluster dependencies
+            # ----------------------------------------------------------------
             aks_count = len(sub_data.get('aks_clusters', []))
             self.logger.info(f"  Analyzing {aks_count} AKS Clusters...")
             for aks in sub_data.get('aks_clusters', []):
-                # AKS to VNet
                 if aks.get('vnet'):
                     dependencies.append({
-                        'source': aks['name'],
-                        'source_type': 'AKS Cluster',
-                        'target': aks['vnet'],
-                        'target_type': 'Virtual Network',
-                        'dependency_type': 'Network Plugin',
-                        'subscription': sub_id
+                        'source': aks['name'], 'source_type': 'AKS Cluster',
+                        'target': aks['vnet'], 'target_type': 'Virtual Network',
+                        'dependency_type': 'Network Plugin', 'subscription': sub_id
                     })
-                
-                # AKS to Container Registry
                 if aks.get('container_registry'):
                     dependencies.append({
-                        'source': aks['name'],
-                        'source_type': 'AKS Cluster',
-                        'target': aks['container_registry'],
-                        'target_type': 'Container Registry',
-                        'dependency_type': 'Image Pull',
-                        'subscription': sub_id
+                        'source': aks['name'], 'source_type': 'AKS Cluster',
+                        'target': aks['container_registry'], 'target_type': 'Container Registry',
+                        'dependency_type': 'Image Pull', 'subscription': sub_id
                     })
             
-            # VNet peering dependencies
+            # ----------------------------------------------------------------
+            # VNet Peering + Subnet → NSG dependencies
+            # ----------------------------------------------------------------
             vnet_count = len(sub_data.get('networks', []))
             self.logger.info(f"  Analyzing {vnet_count} Virtual Networks...")
             for vnet in sub_data.get('networks', []):
                 for peering in vnet.get('peerings', []):
                     if peering.get('remote_vnet'):
                         dependencies.append({
-                            'source': vnet['name'],
-                            'source_type': 'Virtual Network',
-                            'target': peering['remote_vnet'],
-                            'target_type': 'Virtual Network',
-                            'dependency_type': 'VNet Peering',
-                            'subscription': sub_id
+                            'source': vnet['name'], 'source_type': 'Virtual Network',
+                            'target': peering['remote_vnet'], 'target_type': 'Virtual Network',
+                            'dependency_type': 'VNet Peering', 'subscription': sub_id
                         })
-                
-                # Subnet to NSG dependencies
                 for subnet in vnet.get('subnets', []):
                     if subnet.get('nsg'):
                         nsg_name = subnet['nsg'].split('/')[-1] if '/' in subnet['nsg'] else subnet['nsg']
                         dependencies.append({
-                            'source': f"{vnet['name']}/{subnet['name']}",
-                            'source_type': 'Subnet',
-                            'target': nsg_name,
-                            'target_type': 'Network Security Group',
-                            'dependency_type': 'Security Rules',
-                            'subscription': sub_id
+                            'source': f"{vnet['name']}/{subnet['name']}", 'source_type': 'Subnet',
+                            'target': nsg_name, 'target_type': 'Network Security Group',
+                            'dependency_type': 'Security Rules', 'subscription': sub_id
                         })
         
-        self.discovery_data['dependencies'] = dependencies
-        self.logger.info(f"\n✓ Identified {len(dependencies)} total dependencies")
+        # Deduplicate (same source → target via same dependency type)
+        seen = set()
+        unique_deps = []
+        for dep in dependencies:
+            dedup_key = (dep['source'], dep['target'], dep['dependency_type'])
+            if dedup_key not in seen:
+                seen.add(dedup_key)
+                unique_deps.append(dep)
         
-        if len(dependencies) == 0:
+        self.discovery_data['dependencies'] = unique_deps
+        total = len(unique_deps)
+        self.logger.info(f"\n✓ Identified {total} unique dependencies ({len(dependencies)} before dedup)")
+        
+        if total == 0:
             self.logger.warning("⚠ No dependencies found!")
-            self.logger.warning("  This could mean:")
-            self.logger.warning("  - Resources don't have explicit dependencies configured")
-            self.logger.warning("  - App Services have no connection strings or app settings")
-            self.logger.warning("  - VNets have no peering configured")
-            self.logger.warning("  - Insufficient permissions to read resource configurations")
+            self.logger.warning("  Possible reasons:")
+            self.logger.warning("  - App Settings/Connection Strings have no Azure service endpoints")
+            self.logger.warning("  - Sensitive settings (containing 'key'/'secret'/'token'/'password') are masked")
+            self.logger.warning("  - VNets have no peering, AKS has no VNet/ACR configured")
+            self.logger.warning("  - Insufficient permissions to read App Settings (requires Contributor or Website Contributor)")
+        else:
+            type_counts = Counter(d['dependency_type'] for d in unique_deps)
+            self.logger.info("  Dependency breakdown:")
+            for dep_type, count in sorted(type_counts.items(), key=lambda x: -x[1]):
+                self.logger.info(f"    {dep_type}: {count}")
         
-        return dependencies
+        return unique_deps
     
     def build_complete_dependency_map(self):
         """Build complete application-centric dependency mapping"""
