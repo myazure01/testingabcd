@@ -14,9 +14,6 @@ or delete any Azure resources. All Azure SDK calls are limited to:
 
 Required Azure Permissions: Reader role (minimum)
 Safe to run in production environments without risk of modification.
-
-Author: Azure Migration Team
-Date: February 2026
 """
 
 import os
