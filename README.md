@@ -161,6 +161,7 @@ Edit `config.json` to customize:
 ```json
 {
   "auth_method": "default",
+  "subscription_names": [],
   "subscription_ids": [],
   "scan_code": true,
   "azure_devops": {
@@ -204,10 +205,64 @@ python --version
 .\tool\python\python.exe -m pip install --upgrade -r requirements.txt
 ```
 
-### Run with Specific Subscription
+### Filter Subscriptions (Scan Specific Subscriptions)
+
+**Option 1: Scan ALL subscriptions** (default)
+```json
+{
+  "subscription_names": [],
+  "subscription_ids": []
+}
+```
+
+**Option 2: Filter by Subscription NAME(s)**
+```json
+{
+  "subscription_names": ["Production", "Dev"],
+  "subscription_ids": []
+}
+```
+- Case-insensitive matching
+- Supports partial matches (e.g., "Prod" matches "Production-Subscription")
+- Can specify multiple names
+
+**Option 3: Filter by Subscription ID(s)**
+```json
+{
+  "subscription_names": [],
+  "subscription_ids": [
+    "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+  ]
+}
+```
+
+**Option 4: Mix both names AND IDs**
+```json
+{
+  "subscription_names": ["Production"],
+  "subscription_ids": ["xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"]
+}
+```
+- Scans union of both filters
+
+**How to find your subscriptions:**
 ```bash
-# Edit config.json first, then:
+# List all subscriptions
+az account list --output table
+
+# Show current subscription
+az account show
+
+# Get subscription ID
+az account show --query id -o tsv
+```
+
+Then edit `config.json` and run:
+```bash
 .\tool\python\python.exe azure_discovery.py
+# OR simply:
+run.cmd
 ```
 
 ## 🔍 Troubleshooting

@@ -3,7 +3,15 @@
     "_auth_note": "Uses Azure CLI login (az login) - DefaultAzureCredential",
     "auth_method": "default",
     
-    "_subscription_comment": "Leave empty [] to scan all subscriptions, or specify: [\"sub-id-1\", \"sub-id-2\"]",
+    "_subscription_comment": "====== SUBSCRIPTION FILTERING ======",
+    "_subscription_instructions": [
+        "Option 1: Scan ALL subscriptions - Leave both arrays empty: [] []",
+        "Option 2: Filter by NAME - Use subscription_names: ['Production', 'Development']",
+        "Option 3: Filter by ID - Use subscription_ids: ['xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx']",
+        "Option 4: Mix both - Specify both names and IDs (will scan union of both)",
+        "Names are case-insensitive and support partial matching"
+    ],
+    "subscription_names": [],
     "subscription_ids": [],
     
     "_comment_devops": "====== AZURE DEVOPS GIT REPOSITORIES ======",

@@ -324,27 +324,64 @@ class AzureDiscovery:
             return True  # Continue with SDK
     
     def get_subscriptions(self) -> List[Dict]:
-        """Get all accessible subscriptions"""
+        """Get all accessible subscriptions (filtered by names/IDs if configured)"""
         self.logger.info("Discovering subscriptions...")
         subscriptions = []
         
         try:
             sub_client = SubscriptionClient(self.credential)
             
-            if self.config['subscription_ids']:
-                # Use specified subscriptions
-                for sub_id in self.config['subscription_ids']:
-                    try:
-                        sub = sub_client.subscriptions.get(sub_id)
+            subscription_ids = self.config.get('subscription_ids', [])
+            subscription_names = self.config.get('subscription_names', [])
+            
+            # Normalize names for case-insensitive matching
+            subscription_names_lower = [name.lower() for name in subscription_names]
+            
+            if subscription_ids or subscription_names:
+                self.logger.info("Filtering subscriptions...")
+                if subscription_names:
+                    self.logger.info(f"  By names: {subscription_names}")
+                if subscription_ids:
+                    self.logger.info(f"  By IDs: {subscription_ids}")
+                
+                # Get all subscriptions first
+                all_subs = list(sub_client.subscriptions.list())
+                
+                for sub in all_subs:
+                    if sub.state != 'Enabled':
+                        continue
+                    
+                    # Check if subscription matches by ID
+                    matched_by_id = sub.subscription_id in subscription_ids
+                    
+                    # Check if subscription matches by name (case-insensitive, partial match)
+                    matched_by_name = False
+                    if subscription_names_lower:
+                        sub_name_lower = sub.display_name.lower()
+                        matched_by_name = any(name in sub_name_lower for name in subscription_names_lower)
+                    
+                    # Add if matched by either ID or name
+                    if matched_by_id or matched_by_name:
                         subscriptions.append({
                             'id': sub.subscription_id,
                             'name': sub.display_name,
                             'state': sub.state
                         })
-                    except Exception as e:
-                        self.logger.warning(f"Could not access subscription {sub_id}: {e}")
+                        match_reason = []
+                        if matched_by_id:
+                            match_reason.append("ID")
+                        if matched_by_name:
+                            match_reason.append("Name")
+                        self.logger.debug(f"  Matched '{sub.display_name}' by {', '.join(match_reason)}")
+                
+                if not subscriptions:
+                    self.logger.warning("⚠ No subscriptions matched the specified filters!")
+                    self.logger.warning("  Available subscriptions:")
+                    for sub in all_subs[:5]:  # Show first 5
+                        self.logger.warning(f"    - {sub.display_name} ({sub.subscription_id})")
             else:
-                # Get all subscriptions
+                # Get all enabled subscriptions
+                self.logger.info("Scanning ALL subscriptions...")
                 for sub in sub_client.subscriptions.list():
                     if sub.state == 'Enabled':
                         subscriptions.append({
@@ -353,7 +390,7 @@ class AzureDiscovery:
                             'state': sub.state
                         })
             
-            self.logger.info(f"✓ Found {len(subscriptions)} subscription(s)")
+            self.logger.info(f"✓ Found {len(subscriptions)} subscription(s) to scan:")
             for sub in subscriptions:
                 self.logger.info(f"  - {sub['name']} ({sub['id']})")
             
