@@ -58,6 +58,10 @@ if exist ".\tool\python\python.exe" (
 )
 
 REM Run PowerShell script with execution policy bypass
+REM Force UTF-8 so Unicode/emoji in logs don't cause charmap errors on Windows
+set PYTHONIOENCODING=utf-8
+set PYTHONUTF8=1
+
 powershell.exe -ExecutionPolicy Bypass -NoProfile -File "%~dp0run_discovery.ps1"
 
 REM Check exit code

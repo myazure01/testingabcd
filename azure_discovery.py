@@ -18,12 +18,19 @@ Safe to run in production environments without risk of modification.
 
 import os
 import sys
+import io
 import json
 import logging
 from datetime import datetime
 from typing import Dict, List, Any, Set
 from collections import defaultdict, Counter
 import traceback
+
+# ── Force UTF-8 output on Windows (prevents charmap/cp1252 encode errors) ─────
+if hasattr(sys.stdout, 'buffer') and getattr(sys.stdout, 'encoding', '').lower() not in ('utf-8', 'utf-16'):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+if hasattr(sys.stderr, 'buffer') and getattr(sys.stderr, 'encoding', '').lower() not in ('utf-8', 'utf-16'):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
 
 # Azure SDK imports
 try:
@@ -334,8 +341,8 @@ class AzureDiscovery:
             level=getattr(logging, self.config['log_level']),
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler(log_file),
-                logging.StreamHandler(sys.stdout)
+                logging.FileHandler(log_file, encoding='utf-8'),
+                logging.StreamHandler(sys.stdout)  # stdout already set to UTF-8 at module start
             ]
         )
         self.logger = logging.getLogger(__name__)
