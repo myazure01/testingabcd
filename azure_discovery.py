@@ -321,10 +321,32 @@ class AzureDiscovery:
         
         # Skip if required fields are placeholders or empty
         if not organization or not pat_token:
-            print("  ⚠ azure_devops: organization or pat_token is empty - skipping repo URL building")
+            print("")
+            print("  " + "!"*70)
+            print("  !! AZURE DEVOPS GIT REPOS — NOT CONFIGURED")
+            print("  !! 'organization' or 'pat_token' is empty in config.json")
+            print("  !! No repositories will be cloned or scanned.")
+            print("  !!")
+            print("  !! FIX: open config.json and fill in:")
+            print("  !!   azure_devops.organization  → your Azure DevOps org name")
+            print("  !!   azure_devops.pat_token     → a PAT with Code (Read) scope")
+            print("  !!   (DevOps → User Settings → Personal Access Tokens)")
+            print("  " + "!"*70)
+            print("")
             return
         if 'YOUR_' in str(organization) or 'YOUR_' in str(pat_token):
-            print("  ⚠ azure_devops: organization/pat_token still contain placeholder values (YOUR_...) - update config.json")
+            print("")
+            print("  " + "!"*70)
+            print("  !! AZURE DEVOPS GIT REPOS — STILL USING PLACEHOLDER VALUES")
+            print("  !! config.json still contains the default example values.")
+            print("  !! No repositories will be cloned or scanned.")
+            print("  !!")
+            print("  !! FIX: open config.json and replace each YOUR_... value:")
+            print(f"  !!   azure_devops.organization  = '{organization}'  ← replace this")
+            print(f"  !!   azure_devops.pat_token     = '{pat_token[:12]}...'  ← replace this")
+            print("  !!   (DevOps → User Settings → Personal Access Tokens → Code Read)")
+            print("  " + "!"*70)
+            print("")
             return
         
         if not config.get('git_repos'):
@@ -336,7 +358,8 @@ class AzureDiscovery:
             repositories = project_config.get('repositories', [])
             
             if not project_name or 'YOUR_' in str(project_name):
-                print(f"  ⚠ Skipping project with placeholder or empty name: '{project_name}'")
+                print(f"  !! Skipping project — placeholder or empty name: '{project_name}'")
+                print( "  !! Fix: set azure_devops.projects[].project_name in config.json")
                 continue
             
             for repo in repositories:
@@ -364,8 +387,16 @@ class AzureDiscovery:
                 added += 1
         
         if added == 0:
-            print("  ⚠ No repositories were added from azure_devops config.")
-            print("    Check: project_name and repository name fields are correct in config.json")
+            print("")
+            print("  " + "!"*70)
+            print("  !! AZURE DEVOPS — 0 REPOSITORIES ADDED")
+            print("  !! All project/repository names are empty or still placeholders.")
+            print("  !! FIX: open config.json and update:")
+            print("  !!   azure_devops.projects[].project_name  → exact DevOps project name")
+            print("  !!   azure_devops.projects[].repositories[].name → exact repo name")
+            print("  !!   (case-sensitive, must match exactly what you see in Azure DevOps Repos)")
+            print("  " + "!"*70)
+            print("")
     
     def setup_logging(self):
         """Setup logging configuration"""
@@ -2208,9 +2239,32 @@ class AzureDiscovery:
         self.logger.info(f"  DevOps PAT: {'SET' if pat_ok else 'NOT SET or placeholder'}")
 
         if not repos:
-            self.logger.warning("  !! No Git repositories configured.")
-            self.logger.warning("     Edit config.json -> azure_devops -> projects -> repositories")
-            self.logger.warning("     OR add full URLs to git_repos array directly.")
+            sep = "="*70
+            self.logger.warning("")
+            self.logger.warning(sep)
+            self.logger.warning("GIT REPOSITORY SCAN — SKIPPED (no repos configured)")
+            self.logger.warning(sep)
+            self.logger.warning("  No repositories are queued for scanning.")
+            self.logger.warning("  This means code-level Azure dependency mapping will be EMPTY.")
+            self.logger.warning("")
+            self.logger.warning("  OPTION A — Azure DevOps (recommended):")
+            self.logger.warning("    Open config.json and fill in ALL of these fields:")
+            self.logger.warning("      azure_devops.organization          ← your DevOps org name")
+            self.logger.warning("      azure_devops.pat_token             ← PAT with Code (Read)")
+            self.logger.warning("      azure_devops.projects[].project_name ← DevOps project name")
+            self.logger.warning("      azure_devops.projects[].repositories[].name ← repo name")
+            self.logger.warning("      azure_devops.projects[].repositories[].branch ← e.g. main")
+            self.logger.warning("    Create PAT at: DevOps → User Settings → Personal Access Tokens")
+            self.logger.warning("      Scope required: Code (Read)")
+            self.logger.warning("")
+            self.logger.warning("  OPTION B — Manual full URLs:")
+            self.logger.warning('    Add entries directly to git_repos in config.json:')  
+            self.logger.warning('    "git_repos": [')
+            self.logger.warning('      {"url": "https://pat:TOKEN@dev.azure.com/ORG/PROJ/_git/REPO",')
+            self.logger.warning('       "branch": "main"}')
+            self.logger.warning('    ]')
+            self.logger.warning(sep)
+            self.logger.warning("")
             return
 
         temp_dir = os.path.join(self.config['output_dir'], 'temp_repos')
