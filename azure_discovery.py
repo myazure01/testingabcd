@@ -3509,12 +3509,18 @@ class AzureDiscovery:
 '''
         grand_rg_total   = 0
         grand_res_total  = 0
+        empty_rgs        = []   # list of (subscription_name, rg_name, location, tags)
 
         for sub_id, sub_data in self.discovery_data['subscriptions'].items():
             rgs = sub_data.get('resource_groups', {})
             all_sub_res = sum(len(rg.get('resources', [])) for rg in rgs.values())
             grand_rg_total  += len(rgs)
             grand_res_total += all_sub_res
+            for rg_name, rg_data in rgs.items():
+                if not rg_data.get('resources'):
+                    empty_rgs.append((sub_data['name'], rg_name,
+                                      rg_data.get('location', 'N/A'),
+                                      rg_data.get('tags', {})))
 
             html += f'''
             <button class="collapsible">
@@ -3536,10 +3542,21 @@ class AzureDiscovery:
                     for r in resources:
                         type_counts[r.get('type', 'Unknown')] += 1
 
+                    # Visual marker for empty RGs
+                    if not resources:
+                        rg_btn_style = ('margin-left:20px;background:#fff4ce;color:#7a4f01;'
+                                        'border-left:4px solid #f7a800;font-size:13px')
+                        rg_icon = '&#9888;&#65039;'
+                        rg_extra = ' &nbsp;<span style="color:#c7720a;font-size:11px">EMPTY &mdash; no resources</span>'
+                    else:
+                        rg_btn_style = 'margin-left:20px;background:#f5f5f5;color:#333;font-size:13px'
+                        rg_icon = '&#128200;'
+                        rg_extra = ''
+
                     html += f'''
-                <button class="collapsible" style="margin-left:20px;background:#f5f5f5;color:#333;font-size:13px">
-                    &#128200; {rg_name}
-                    &nbsp;<small>({rg_data.get("location","?")} &middot; {len(resources)} resource(s))</small>
+                <button class="collapsible" style="{rg_btn_style}">
+                    {rg_icon} {rg_name}
+                    &nbsp;<small>({rg_data.get("location","?")} &middot; {len(resources)} resource(s))</small>{rg_extra}
                 </button>
                 <div class="collapsible-content" style="margin-left:20px">
                     <div style="margin-bottom:8px">
@@ -3597,12 +3614,53 @@ class AzureDiscovery:
             </div>
 '''
 
+        # ── Empty Resource Groups warning block ─────────────────────────────────
+        if empty_rgs:
+            empty_rows = ''.join(
+                f'<tr>'
+                f'<td>{sub}</td>'
+                f'<td><strong>{rg}</strong></td>'
+                f'<td>{loc}</td>'
+                f'<td>{tags_html(tags)}</td>'
+                f'</tr>'
+                for sub, rg, loc, tags in sorted(empty_rgs)
+            )
+            html += f'''
+            <div style="margin-top:20px;padding:16px 20px;background:#fff4ce;
+                        border-left:4px solid #f7a800;border-radius:6px">
+                <h3 style="color:#7a4f01;margin-bottom:10px">
+                    &#9888;&#65039; {len(empty_rgs)} Empty Resource Group(s) Detected
+                </h3>
+                <p style="color:#5c3b00;font-size:13px;margin-bottom:12px">
+                    These resource groups contain no resources and may represent
+                    unused infrastructure, orphaned deployments, or cost-incurring
+                    placeholders. Review and delete if no longer needed.
+                </p>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Subscription</th>
+                            <th>Resource Group</th>
+                            <th>Location</th>
+                            <th>Tags</th>
+                        </tr>
+                    </thead>
+                    <tbody>{empty_rows}</tbody>
+                </table>
+            </div>
+'''
+
+        empty_note = (
+            f'&mdash; <span style="color:#c7720a"><strong>{len(empty_rgs)} empty</strong></span>'
+            if empty_rgs else ''
+        )
         html += f'''
             <div style="margin-top:16px;padding:12px 18px;background:#f0f6ff;
                         border-left:4px solid #0078d4;border-radius:4px;font-size:13px">
                 <strong>Grand Total:</strong>&nbsp;
                 {grand_rg_total} resource group(s) across all subscriptions,
-                {grand_res_total} total resource(s).
+                {grand_res_total} total resource(s)
+                {empty_note}.
             </div>
         </div>
 '''
@@ -3644,15 +3702,25 @@ class AzureDiscovery:
             return '#605e5c'
 
         # ── collect grand totals ────────────────────────────────────────
-        grand_subs = 0
-        grand_rgs  = 0
-        grand_res  = 0
+        grand_subs  = 0
+        grand_rgs   = 0
+        grand_res   = 0
+        grand_empty = 0
+        empty_rg_list = []   # (sub_name, rg_name, location, tags_str)
         all_types: Dict[str, int] = defaultdict(int)
         for sub_data in self.discovery_data['subscriptions'].values():
             grand_subs += 1
-            for rg_data in sub_data.get('resource_groups', {}).values():
+            for rg_name_k, rg_data in sub_data.get('resource_groups', {}).items():
                 grand_rgs += 1
-                for r in rg_data.get('resources', []):
+                res_list = rg_data.get('resources', [])
+                if not res_list:
+                    grand_empty += 1
+                    empty_rg_list.append((
+                        sub_data['name'], rg_name_k,
+                        rg_data.get('location', 'N/A'),
+                        '; '.join(f'{k}={v}' for k, v in (rg_data.get('tags') or {}).items())
+                    ))
+                for r in res_list:
                     grand_res += 1
                     all_types[r.get('type', 'Unknown')] += 1
 
@@ -3672,13 +3740,14 @@ class AzureDiscovery:
                 resources = rg_data.get('resources', [])
                 if not resources:
                     row_num += 1
-                    stripe = '#fafafa' if row_num % 2 == 0 else '#fff'
                     body_rows += f'''
-                    <tr style="background:{stripe}">
+                    <tr class="empty-rg-row" style="background:#fff4ce">
                         <td>{sub_name}</td>
-                        <td><strong>{rg_name}</strong></td>
-                        <td style="color:#999">{rg_loc}</td>
-                        <td style="color:#999">— (empty resource group)</td>
+                        <td><strong>{rg_name}</strong>
+                            <span style="background:#f7a800;color:#fff;border-radius:3px;
+                                padding:1px 6px;font-size:10px;margin-left:6px">EMPTY</span></td>
+                        <td>{rg_loc}</td>
+                        <td style="color:#7a4f01;font-style:italic">— no resources</td>
                         <td></td>
                         <td></td>
                         <td style="font-size:11px;color:#777">{rg_tags}</td>
@@ -3701,6 +3770,43 @@ class AzureDiscovery:
                     </tr>'''
 
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        empty_stat_cls = "warn" if grand_empty else "ok"
+        empty_hdr_note = (
+            f"&nbsp;|&nbsp; <strong style='color:#ffe284'>{grand_empty} empty RG(s)</strong>"
+            if grand_empty else ""
+        )
+
+        # ── Empty RGs panel rows ───────────────────────────────────────────
+        if empty_rg_list:
+            empty_panel_rows = ''.join(
+                f'<tr><td>{sub}</td><td><strong>{rg}</strong></td>'
+                f'<td>{loc}</td><td style="font-size:11px;color:#555">{tags or "—"}</td></tr>'
+                for sub, rg, loc, tags in sorted(empty_rg_list)
+            )
+            empty_panel = f'''
+  <div class="panel" style="border-left:4px solid #f7a800">
+    <h2 style="color:#7a4f01">&#9888;&#65039; Empty Resource Groups ({grand_empty})</h2>
+    <p style="color:#5c3b00;font-size:12px;margin-bottom:12px">
+      These resource groups contain <strong>no resources</strong>.
+      They may represent unused infrastructure, orphaned deployments, or cost-incurring
+      placeholders. Review and consider deleting them if no longer needed.
+    </p>
+    <table>
+      <thead>
+        <tr style="background:#f7a800">
+          <th>Subscription</th><th>Resource Group</th><th>Location</th><th>Tags</th>
+        </tr>
+      </thead>
+      <tbody>{empty_panel_rows}</tbody>
+    </table>
+  </div>'''
+        else:
+            empty_panel = '''
+  <div class="panel" style="border-left:4px solid #107c10">
+    <h2 style="color:#107c10">&#10003; No Empty Resource Groups</h2>
+    <p style="color:#555;font-size:12px">All discovered resource groups contain at least one resource.</p>
+  </div>'''
+
         html = f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3718,6 +3824,10 @@ class AzureDiscovery:
   .stat-bar {{ display:flex; gap:16px; flex-wrap:wrap; margin-bottom:24px; }}
   .stat {{ background:#fff; border-radius:8px; border-left:4px solid #0078d4;
            padding:12px 20px; min-width:160px; box-shadow:0 1px 3px rgba(0,0,0,.08); }}
+  .stat.warn {{ border-left-color:#f7a800; }}
+  .stat.warn .num {{ color:#c7720a; }}
+  .stat.ok   {{ border-left-color:#107c10; }}
+  .stat.ok   .num {{ color:#107c10; }}
   .stat .num {{ font-size:26px; font-weight:700; color:#0078d4; }}
   .stat .lbl {{ font-size:11px; color:#777; text-transform:uppercase; letter-spacing:.5px; }}
   .panel {{ background:#fff; border-radius:8px; padding:20px 24px;
@@ -3728,12 +3838,12 @@ class AzureDiscovery:
   th {{ background:#0078d4; color:#fff; padding:8px 10px; text-align:left; font-weight:600; }}
   td {{ padding:6px 10px; border-bottom:1px solid #f0f0f0; vertical-align:top; }}
   tr:hover td {{ background:#e8f3ff !important; }}
+  .empty-rg-row td {{ background:#fff4ce !important; }}
   .filter-bar {{ display:flex; gap:10px; margin-bottom:14px; flex-wrap:wrap; }}
-  .filter-bar input, .filter-bar select {{
-      padding:6px 10px; border:1px solid #ccc; border-radius:5px;
-      font-size:12px; outline:none;
-  }}
+  .filter-bar input {{ padding:6px 10px; border:1px solid #ccc; border-radius:5px;
+      font-size:12px; outline:none; flex:1; min-width:200px; }}
   .filter-bar input:focus {{ border-color:#0078d4; }}
+  .filter-bar label {{ display:flex; align-items:center; gap:6px; font-size:12px; cursor:pointer; }}
   #rowCount {{ font-size:12px; color:#666; align-self:center; margin-left:auto; }}
   footer {{ text-align:center; color:#aaa; font-size:11px; padding:20px; }}
 </style>
@@ -3744,7 +3854,8 @@ class AzureDiscovery:
   <p>Generated: {now_str} &nbsp;|&nbsp;
      {grand_subs} subscription(s) &nbsp;|&nbsp;
      {grand_rgs} resource group(s) &nbsp;|&nbsp;
-     {grand_res} resource(s)</p>
+     {grand_res} resource(s)
+     {empty_hdr_note}</p>
 </header>
 <div class="container">
 
@@ -3754,7 +3865,10 @@ class AzureDiscovery:
     <div class="stat"><div class="num">{grand_rgs}</div><div class="lbl">Resource Groups</div></div>
     <div class="stat"><div class="num">{grand_res}</div><div class="lbl">Total Resources</div></div>
     <div class="stat"><div class="num">{len(all_types)}</div><div class="lbl">Distinct Types</div></div>
+    <div class="stat {empty_stat_cls}"><div class="num">{grand_empty}</div><div class="lbl">Empty RGs</div></div>
   </div>
+
+  {empty_panel}
 
   <!-- Top types panel -->
   <div class="panel">
@@ -3769,7 +3883,8 @@ class AzureDiscovery:
   <div class="panel">
     <h2>Full Inventory</h2>
     <div class="filter-bar">
-      <input id="search" placeholder="&#128269; Filter by name, type, RG..." style="flex:1;min-width:200px">
+      <input id="search" placeholder="&#128269; Filter by name, type, RG...">
+      <label><input type="checkbox" id="showEmpty" checked> Show empty RGs</label>
       <span id="rowCount"></span>
     </div>
     <table id="invTable">
@@ -3794,21 +3909,26 @@ class AzureDiscovery:
 <footer>Azure Discovery Tool &mdash; Resource Group Inventory &mdash; {now_str}</footer>
 <script>
 (function(){{
-  var rows = Array.from(document.querySelectorAll('#invBody tr'));
+  var rows   = Array.from(document.querySelectorAll('#invBody tr'));
   var countEl = document.getElementById('rowCount');
   function updateCount(n) {{ countEl.textContent = n + ' / ' + rows.length + ' rows'; }}
   updateCount(rows.length);
-  document.getElementById('search').addEventListener('input', function(){{
-    var q = this.value.toLowerCase();
+  function applyFilter() {{
+    var q         = document.getElementById('search').value.toLowerCase();
+    var showEmpty = document.getElementById('showEmpty').checked;
     var shown = 0;
     rows.forEach(function(r){{
-      var txt = r.textContent.toLowerCase();
-      var vis = !q || txt.includes(q);
+      var isEmpty = r.classList.contains('empty-rg-row');
+      var txt     = r.textContent.toLowerCase();
+      var vis = (!q || txt.includes(q)) && (showEmpty || !isEmpty);
       r.style.display = vis ? '' : 'none';
       if(vis) shown++;
     }});
     updateCount(shown);
-  }});
+  }}
+  document.getElementById('search').addEventListener('input', applyFilter);
+  document.getElementById('showEmpty').addEventListener('change', applyFilter);
+  applyFilter();
 }})();
 </script>
 </body>
@@ -4583,6 +4703,7 @@ class AzureDiscovery:
         # Create sheets
         self._create_summary_sheet(wb)
         self._create_resource_groups_sheet(wb)
+        self._create_empty_rgs_sheet(wb)
         self._create_application_dependencies_sheet(wb)
         self._create_arm_templates_sheet(wb)
         self._create_code_inventory_sheet(wb)
@@ -4615,7 +4736,8 @@ class AzureDiscovery:
         ]
         RG_HEADER_FILL = PatternFill(start_color="DEECF9", end_color="DEECF9", fill_type="solid")
         RG_FONT        = Font(bold=True, size=11, color="004578")
-        EMPTY_FILL     = PatternFill(start_color="FAFAFA", end_color="FAFAFA", fill_type="solid")
+        EMPTY_FILL     = PatternFill(start_color="FFF4CE", end_color="FFF4CE", fill_type="solid")
+        EMPTY_FONT     = Font(italic=True, color="7A4F01")
         WRAP           = Alignment(wrap_text=True, vertical="top")
         THIN_BORDER    = Border(
             bottom=Side(style='thin', color='D0D0D0'),
@@ -4650,14 +4772,13 @@ class AzureDiscovery:
                 if not resources:
                     # Empty RG — one placeholder row
                     vals = [sub_name, rg_name, rg_loc, rg_tags,
-                            '(empty)', '', '', '']
+                            '(empty — no resources)', '', '', '']
                     for col_idx, val in enumerate(vals, 1):
                         cell = ws.cell(row=row, column=col_idx, value=val)
                         cell.fill      = EMPTY_FILL
                         cell.alignment = WRAP
                         cell.border    = THIN_BORDER
-                        if col_idx <= 4:
-                            cell.font  = Font(italic=True, color='888888')
+                        cell.font      = EMPTY_FONT
                     row += 1
                 else:
                     for res_data in resources:
@@ -4692,6 +4813,73 @@ class AzureDiscovery:
 
         # ── Auto-filter ──────────────────────────────────────────────────
         ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{row - 1}"
+
+    def _create_empty_rgs_sheet(self, wb):
+        """Create a dedicated sheet listing only empty resource groups."""
+        ws = wb.create_sheet("Empty Resource Groups")
+
+        HDR_FILL = PatternFill(start_color="F7A800", end_color="F7A800", fill_type="solid")
+        HDR_FONT = Font(bold=True, color="FFFFFF", size=11)
+        ROW_FILL = PatternFill(start_color="FFF4CE", end_color="FFF4CE", fill_type="solid")
+        ALT_FILL = PatternFill(start_color="FEE9A0", end_color="FEE9A0", fill_type="solid")
+        WRAP     = Alignment(wrap_text=True, vertical="top")
+        THIN     = Border(
+            bottom=Side(style='thin', color='E0C060'),
+            right=Side(style='thin',  color='E0C060')
+        )
+
+        headers = ["Subscription", "Resource Group", "Location", "Tags",
+                   "Recommendation"]
+        for col_idx, hdr in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_idx, value=hdr)
+            cell.font      = HDR_FONT
+            cell.fill      = HDR_FILL
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.freeze_panes = 'A2'
+        ws.row_dimensions[1].height = 18
+
+        row      = 2
+        row_idx  = 0
+        found    = False
+        for sub_data in self.discovery_data['subscriptions'].values():
+            sub_name = sub_data['name']
+            for rg_name, rg_data in sorted(sub_data.get('resource_groups', {}).items()):
+                if rg_data.get('resources'):
+                    continue  # skip non-empty
+                found = True
+                row_idx += 1
+                fill = ROW_FILL if row_idx % 2 == 1 else ALT_FILL
+                rg_loc  = rg_data.get('location', 'N/A')
+                rg_tags = '; '.join(
+                    f'{k}={v}' for k, v in (rg_data.get('tags') or {}).items()
+                )
+                vals = [
+                    sub_name,
+                    rg_name,
+                    rg_loc,
+                    rg_tags or '—',
+                    'Review and delete if no longer needed to avoid orphaned costs',
+                ]
+                for col_idx, val in enumerate(vals, 1):
+                    cell = ws.cell(row=row, column=col_idx, value=val)
+                    cell.fill      = fill
+                    cell.alignment = WRAP
+                    cell.border    = THIN
+                    if col_idx == 2:
+                        cell.font = Font(bold=True, color="7A4F01")
+                row += 1
+
+        if not found:
+            cell = ws.cell(row=2, column=1,
+                           value="✅ No empty resource groups found — all RGs contain at least one resource.")
+            cell.font = Font(italic=True, color="107C10")
+
+        col_widths = [30, 36, 18, 50, 56]
+        for col_idx, width in enumerate(col_widths, 1):
+            ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+        if row > 2:
+            ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{row - 1}"
 
     def _create_summary_sheet(self, wb):
         """Create summary sheet in Excel"""
