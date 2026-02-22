@@ -21,6 +21,9 @@ import sys
 import io
 import json
 import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Dict, List, Any, Set
 from collections import defaultdict, Counter
@@ -3334,106 +3337,207 @@ class AzureDiscovery:
 
     def _get_resource_full_detail(self, resource_id: str,
                                    resource_type: str) -> Dict:
-        """Run `az resource show` and return the parsed JSON, or {} on failure."""
+        """Run `az resource show --ids` with a 30-second hard timeout.
+
+        Retries once on HTTP 429 (rate-limit) or 503 (service unavailable).
+        Returns {} on any failure so callers always get a safe value.
+        """
+        if not resource_id:
+            return {}
         import subprocess as _sp
         api_ver = self._get_api_version(resource_type)
-        # NOTE: --ids already encodes the subscription; do NOT pass --subscription
-        # alongside --ids or the CLI will raise a conflict error.
         cmd = [
             'az', 'resource', 'show',
             '--ids',         resource_id,
             '--api-version', api_ver,
             '--output',      'json',
         ]
-        try:
-            r = _sp.run(cmd, capture_output=True, text=True, timeout=60, shell=True)
-            if r.returncode == 0 and r.stdout.strip():
-                return json.loads(r.stdout)
-            self.logger.debug(f"      az resource show non-zero exit for {resource_id}: "
-                              f"{r.stderr[:200]}")
-        except Exception as ex:
-            self.logger.debug(f"      az resource show failed for {resource_id}: {ex}")
+        for attempt in range(2):          # up to 2 attempts
+            try:
+                r = _sp.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,           # hard 30-second cap per resource
+                    env={**os.environ},
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    parsed = json.loads(r.stdout)
+                    return parsed if isinstance(parsed, dict) else {}
+                stderr = (r.stderr or '').lower()
+                if '429' in stderr or 'too many requests' in stderr:
+                    time.sleep(2 ** attempt)   # 1s then 2s back-off
+                    continue
+                if '503' in stderr or 'service unavailable' in stderr:
+                    time.sleep(2 ** attempt)
+                    continue
+                self.logger.debug(
+                    f'az resource show failed rc={r.returncode} '
+                    f'id={resource_id} err={r.stderr[:200]}'
+                )
+                return {}
+            except _sp.TimeoutExpired:
+                self.logger.debug(f'az resource show timed out (30s): {resource_id}')
+                return {}
+            except json.JSONDecodeError as e:
+                self.logger.debug(f'az resource show JSON error {resource_id}: {e}')
+                return {}
+            except Exception as e:
+                self.logger.debug(f'az resource show unexpected error {resource_id}: {e}')
+                return {}
         return {}
 
     def export_resource_properties(self) -> Dict[str, Any]:
-        """Fetch full ARM properties for every discovered resource via az resource show.
+        """Fetch full ARM properties for every discovered resource.
 
-        Returns a nested dict::
+        Uses a thread pool (``parallel_workers`` config key, default 10) for
+        parallel ``az resource show`` calls.  Prints a live progress bar to
+        stdout so the user can see exactly what is happening.
 
-            {
-              sub_id: {
-                'name': str,
-                'resource_groups': {
-                  rg_name: {
-                    'location': str,
-                    'tags':     dict,
-                    'resources': [
-                      {
-                        id, name, type, location, sku, kind, zones, tags,
-                        api_version, properties, arm_snippet,
-                        redeploy_notes, sensitive_keys
-                      }, ...
-                    ]
-                  }
-                }
-              }
-            }
+        Returns a nested inventory dict keyed by subscription_id.
         """
-        self.logger.info("\n" + "=" * 80)
-        self.logger.info("Exporting Full Resource Properties (cross-tenant deployment)")
-        self.logger.info("=" * 80)
+        max_workers: int = int(self.config.get('parallel_workers', 10))
 
-        result: Dict[str, Any] = {}
-        total_resources = 0
+        sep = '=' * 72
+        print(f'\n{sep}')
+        print('  EXPORTING FULL RESOURCE PROPERTIES  (cross-tenant redeployment)')
+        print(sep)
 
-        # discovery_data['subscriptions'] is a dict keyed by subscription_id
+        full_result: Dict[str, Any] = {}
+
         for sub_id, sub_data in self.discovery_data.get('subscriptions', {}).items():
             sub_name = sub_data.get('name', sub_id)
-            result[sub_id] = {'name': sub_name, 'resource_groups': {}}
+            print(f'\n  Subscription : {sub_name}')
+            print(f'  ID           : {sub_id}')
 
-            rg_map: Dict[str, Any] = sub_data.get('resource_groups', {})
-            for rg_name, rg_data in rg_map.items():
-                resources_out: List[Dict] = []
+            # ── collect flat resource list from already-discovered data ────
+            print('  Step 1/3  : Collecting resource list from discovery data...', flush=True)
+            work_items: List[tuple] = []   # (rg_name, res_dict)
+            for rg_name, rg_data in sub_data.get('resource_groups', {}).items():
                 for res in rg_data.get('resources', []):
-                    res_id   = res.get('id',       '')
-                    res_name = res.get('name',     '')
-                    res_type = res.get('type',     '')
-                    res_loc  = res.get('location', '')
+                    work_items.append((rg_name, rg_data, res))
 
-                    self.logger.debug(f"   Fetching detail: {res_name} ({res_type})")
-                    detail = self._get_resource_full_detail(res_id, res_type)
+            total = len(work_items)
+            if total == 0:
+                print('  ⚠  No resources found in this subscription — skipping.')
+                continue
+            print(f'  ✅ Step 1/3  : {total} resources across '
+                  f"{len(sub_data.get('resource_groups', {}))} resource groups")
 
-                    arm_snippet    = self._build_arm_snippet(res_name, res_type,
-                                                             res_loc, detail)
-                    redeploy_notes = self._generate_redeploy_notes(res_type, detail)
-                    sensitive_keys = self._flag_sensitive_params(res_type, detail)
+            # ── parallel az resource show ──────────────────────────────────
+            print(f'  Step 2/3  : Fetching full properties'
+                  f' ({max_workers} parallel workers, 30s timeout each)...')
 
-                    resources_out.append({
-                        'id':             res_id,
-                        'name':           res_name,
-                        'type':           res_type,
-                        'location':       res_loc,
-                        'sku':            detail.get('sku'),
-                        'kind':           detail.get('kind'),
-                        'zones':          detail.get('zones'),
-                        'tags':           detail.get('tags', {}),
-                        'api_version':    self._get_api_version(res_type),
-                        'properties':     detail.get('properties', {}),
-                        'arm_snippet':    arm_snippet,
-                        'redeploy_notes': redeploy_notes,
-                        'sensitive_keys': sensitive_keys,
-                    })
-                    total_resources += 1
+            lock        = threading.Lock()
+            done_count  = [0]         # list so closure can mutate
+            fail_count  = [0]
+            t_start     = time.time()
 
-                result[sub_id]['resource_groups'][rg_name] = {
-                    'location':  rg_data.get('location', ''),
-                    'tags':      rg_data.get('tags',     {}),
-                    'resources': resources_out,
+            def _fetch(item):
+                rg_name, rg_data, res = item
+                res_id   = res.get('id',       '')
+                res_name = res.get('name',     '')
+                res_type = res.get('type',     '')
+                res_loc  = res.get('location', '')
+
+                detail         = self._get_resource_full_detail(res_id, res_type)
+                arm_snippet    = self._build_arm_snippet(res_name, res_type, res_loc,
+                                                         detail if detail else res)
+                redeploy_notes = self._generate_redeploy_notes(res_type,
+                                                                detail if detail else res)
+                sensitive_keys = self._flag_sensitive_params(res_type,
+                                                             detail if detail else res)
+
+                enriched = {
+                    'id':             res_id,
+                    'name':           res_name,
+                    'type':           res_type,
+                    'location':       res_loc,
+                    'sku':            (detail or res).get('sku')  or {},
+                    'kind':           (detail or res).get('kind') or '',
+                    'zones':          (detail or res).get('zones') or [],
+                    'tags':           (detail or res).get('tags') or {},
+                    'api_version':    self._get_api_version(res_type),
+                    'properties':     (detail or {}).get('properties') or {},
+                    'arm_snippet':    arm_snippet,
+                    'redeploy_notes': redeploy_notes,
+                    'sensitive_keys': sensitive_keys,
+                    # keep rg_meta for assembly
+                    '_rg_name':       rg_name,
+                    '_rg_location':   rg_data.get('location', ''),
+                    '_rg_tags':       rg_data.get('tags', {}),
                 }
 
-        self.logger.info(f"Collected full properties for {total_resources} resource(s)")
-        self._full_inventory = result   # cache for Excel sheet
-        return result
+                with lock:
+                    done_count[0] += 1
+                    if not detail:
+                        fail_count[0] += 1
+                    done    = done_count[0]
+                    elapsed = time.time() - t_start
+                    rate    = done / elapsed if elapsed > 0 else 1
+                    remain  = int((total - done) / rate) if rate > 0 else 0
+                    pct     = int(done * 100 / total)
+                    filled  = pct // 2          # 50-char bar
+                    bar     = '\u2588' * filled + '\u2591' * (50 - filled)
+                    eta     = (f'{remain // 60}m {remain % 60}s'
+                               if remain >= 60 else f'{remain}s')
+                    warn    = '\u26a0 ' if not detail else '  '
+                    print(
+                        f'\r  {warn}[{bar}] {pct:3d}%  '
+                        f'{done}/{total}  ETA: {eta:<8}  '
+                        f'\u274c failed: {fail_count[0]}   ',
+                        end='', flush=True,
+                    )
+
+                return enriched
+
+            results: List[Dict] = []
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(_fetch, item): item for item in work_items}
+                for fut in as_completed(futures):
+                    try:
+                        results.append(fut.result(timeout=90))
+                    except Exception as exc:
+                        with lock:
+                            fail_count[0] += 1
+                            done_count[0] += 1
+                        self.logger.debug(f'Future error: {exc}')
+
+            elapsed_total = time.time() - t_start
+            ok = total - fail_count[0]
+            print(f'\n  ✅ Step 2/3  : Done in {elapsed_total:.1f}s  '
+                  f'({ok}/{total} fetched, {fail_count[0]} failed/timed-out)')
+
+            # ── assemble into rg-grouped structure ─────────────────────────
+            print('  Step 3/3  : Assembling resource group inventory...', flush=True)
+            rg_inventory: Dict[str, Any] = {}
+            for entry in results:
+                rg  = entry.pop('_rg_name')
+                loc = entry.pop('_rg_location')
+                tgs = entry.pop('_rg_tags')
+                if rg not in rg_inventory:
+                    rg_inventory[rg] = {'location': loc, 'tags': tgs, 'resources': []}
+                rg_inventory[rg]['resources'].append(entry)
+
+            full_result[sub_id] = {
+                'name':            sub_name,
+                'resource_groups': rg_inventory,
+            }
+
+            # per-RG summary table
+            print(f'  ✅ Step 3/3  : Assembled {len(rg_inventory)} resource groups')
+            print(f'\n  {"Resource Group":<42} {"Resources":>9}')
+            print(f'  {"-"*42} {"-"*9}')
+            for rg, rg_d in sorted(rg_inventory.items()):
+                print(f'  {rg:<42} {len(rg_d["resources"]):>9}')
+            print(f'  {"-"*42} {"-"*9}')
+            print(f'  {"TOTAL":<42} {total:>9}\n')
+
+        print(sep)
+        print('  Full resource property export complete.')
+        print(sep + '\n')
+        self._full_inventory = full_result   # cache for Excel sheet
+        return full_result
 
     def generate_deployment_package(self, full_inventory: Dict[str, Any]) -> str:
         """Write one deployment package folder per resource group.
@@ -6277,9 +6381,45 @@ function exportCSV(){{
                 self.scan_git_repositories()
             
             # Phase 6 — full resource property export & deployment packages
-            full_inventory   = self.export_resource_properties()
-            inventory_html   = self.generate_full_inventory_html(full_inventory)
-            deployment_pkg   = self.generate_deployment_package(full_inventory)
+            # Gated on config flags: export_resource_properties / export_deployment_package
+            full_inventory:  Dict[str, Any] = {}
+            inventory_html   = 'skipped (export_resource_properties=false in config)'
+            deployment_pkg   = 'skipped (export_deployment_package=false in config)'
+
+            if self.config.get('export_resource_properties', True):
+                try:
+                    full_inventory = self.export_resource_properties()
+                except KeyboardInterrupt:
+                    print('\n\n  ⚠  Export interrupted (Ctrl+C). '
+                          'Continuing with reports using data collected so far.')
+                    full_inventory = getattr(self, '_full_inventory', {})
+                except Exception as _exp_err:
+                    self.logger.error(f'export_resource_properties failed: {_exp_err}')
+                    self.logger.error(traceback.format_exc())
+                    print(f'\n  ❌ Export failed: {_exp_err}\n'
+                          f'     Reports will be generated without full properties.\n')
+            else:
+                self.logger.info(
+                    'export_resource_properties=false in config — skipping property export')
+
+            if full_inventory:
+                try:
+                    print('\n  Generating full resource inventory HTML...')
+                    inventory_html = self.generate_full_inventory_html(full_inventory)
+                    print(f'  ✅ Inventory HTML : {inventory_html}')
+                except Exception as _html_err:
+                    self.logger.error(f'generate_full_inventory_html failed: {_html_err}')
+
+                if self.config.get('export_deployment_package', True):
+                    try:
+                        print('\n  Building deployment packages (ARM templates + scripts)...')
+                        deployment_pkg = self.generate_deployment_package(full_inventory)
+                        print(f'  ✅ Deployment pkg : {deployment_pkg}')
+                    except Exception as _pkg_err:
+                        self.logger.error(f'generate_deployment_package failed: {_pkg_err}')
+                else:
+                    self.logger.info(
+                        'export_deployment_package=false in config — skipping package gen')
 
             # Generate reports
             html_file  = self.generate_html_report()

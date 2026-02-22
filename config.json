@@ -47,5 +47,18 @@
     "scan_network_flows": true,
     "deep_dependency_analysis": true,
     "excluded_resource_groups": [],
-    "log_level": "INFO"
+    "log_level": "INFO",
+
+    "_comment_export": "====== RESOURCE PROPERTY EXPORT (Cross-Tenant Deployment) ======",
+    "_export_instructions": [
+        "export_resource_properties : true = fetch full ARM properties for every resource",
+        "export_deployment_package  : true = generate ARM templates + deploy scripts per RG",
+        "parallel_workers           : number of parallel 'az resource show' calls (1-20)",
+        "                             10 is the default and safe for most tenants.",
+        "                             Increase to 15-20 for faster export on large tenants.",
+        "                             Reduce to 5 if you see HTTP 429 rate-limit errors."
+    ],
+    "export_resource_properties": true,
+    "export_deployment_package": true,
+    "parallel_workers": 10
 }
