@@ -3092,7 +3092,9 @@ class AzureDiscovery:
 
     def _write_json(self, path: str, data: Any) -> None:
         """Write data as pretty-printed JSON to path, creating parent dirs as needed."""
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(path, 'w', encoding='utf-8') as fh:
             json.dump(data, fh, indent=2, default=str)
 
@@ -3277,15 +3279,16 @@ class AzureDiscovery:
         return list(dict.fromkeys(found))  # deduplicate, preserve order
 
     def _get_resource_full_detail(self, resource_id: str,
-                                   sub_id: str, resource_type: str) -> Dict:
+                                   resource_type: str) -> Dict:
         """Run `az resource show` and return the parsed JSON, or {} on failure."""
         import subprocess as _sp
         api_ver = self._get_api_version(resource_type)
+        # NOTE: --ids already encodes the subscription; do NOT pass --subscription
+        # alongside --ids or the CLI will raise a conflict error.
         cmd = [
             'az', 'resource', 'show',
             '--ids',         resource_id,
             '--api-version', api_ver,
-            '--subscription', sub_id,
             '--output',      'json',
         ]
         try:
@@ -3329,12 +3332,12 @@ class AzureDiscovery:
         result: Dict[str, Any] = {}
         total_resources = 0
 
-        for sub in self.discovery_data.get('subscriptions', []):
-            sub_id   = sub['id']
-            sub_name = sub['name']
+        # discovery_data['subscriptions'] is a dict keyed by subscription_id
+        for sub_id, sub_data in self.discovery_data.get('subscriptions', {}).items():
+            sub_name = sub_data.get('name', sub_id)
             result[sub_id] = {'name': sub_name, 'resource_groups': {}}
 
-            rg_map: Dict[str, Any] = sub.get('resource_groups', {})
+            rg_map: Dict[str, Any] = sub_data.get('resource_groups', {})
             for rg_name, rg_data in rg_map.items():
                 resources_out: List[Dict] = []
                 for res in rg_data.get('resources', []):
@@ -3344,7 +3347,7 @@ class AzureDiscovery:
                     res_loc  = res.get('location', '')
 
                     self.logger.debug(f"   Fetching detail: {res_name} ({res_type})")
-                    detail = self._get_resource_full_detail(res_id, sub_id, res_type)
+                    detail = self._get_resource_full_detail(res_id, res_type)
 
                     arm_snippet    = self._build_arm_snippet(res_name, res_type,
                                                              res_loc, detail)
@@ -3370,7 +3373,7 @@ class AzureDiscovery:
 
                 result[sub_id]['resource_groups'][rg_name] = {
                     'location':  rg_data.get('location', ''),
-                    'tags':      rg_data.get('tags', {}),
+                    'tags':      rg_data.get('tags',     {}),
                     'resources': resources_out,
                 }
 
@@ -3555,21 +3558,27 @@ class AzureDiscovery:
         sub_opts: Set[str]  = set()
         type_opts: Set[str] = set()
 
+        import html as _html   # stdlib – escape untrusted data injected into HTML
+        _he = _html.escape     # shorthand: _he(s) → HTML-safe string
+
         for sub_id, sub_data in full_inventory.items():
-            sub_name = sub_data.get('name', sub_id)
+            sub_name = _he(str(sub_data.get('name', sub_id)))
             sub_opts.add(sub_name)
             for rg_name, rg_data in sub_data.get('resource_groups', {}).items():
+                rg_name_h = _he(rg_name)
                 for res in rg_data.get('resources', []):
                     total_res += 1
                     rid    = f"res_{total_res}"
-                    rname  = res.get('name',     '')
-                    rtype  = res.get('type',     '')
-                    rloc   = res.get('location', '')
-                    sku    = (res.get('sku') or {}).get('name', '')
+                    rname  = _he(str(res.get('name',     '')))
+                    rtype  = str(res.get('type',     ''))
+                    rloc   = _he(str(res.get('location', '')))
+                    sku_d  = res.get('sku') or {}
+                    sku    = _he(str(sku_d.get('name', '') if isinstance(sku_d, dict) else ''))
                     notes  = res.get('redeploy_notes', [])
                     sens   = res.get('sensitive_keys',  [])
-                    apiver = res.get('api_version',     '')
-                    type_opts.add(rtype)
+                    apiver = _he(str(res.get('api_version', '')))
+                    rtype_h = _he(rtype)
+                    type_opts.add(rtype_h)
 
                     has_sens   = bool(sens)
                     if has_sens:
@@ -3600,10 +3609,10 @@ class AzureDiscovery:
 
                     rows_html += (
                         f'<tr class="{row_cls}" data-sub="{sub_name}" '
-                        f'data-type="{rtype}" onclick="openModal(\'{rid}\')" '
+                        f'data-type="{rtype_h}" onclick="openModal(\'{rid}\')" '
                         f'style="cursor:pointer">'
-                        f'<td>{sub_name}</td><td>{rg_name}</td><td>{rname}</td>'
-                        f'<td>{rtype}</td><td>{rloc}</td><td>{sku}</td>'
+                        f'<td>{sub_name}</td><td>{rg_name_h}</td><td>{rname}</td>'
+                        f'<td>{rtype_h}</td><td>{rloc}</td><td>{sku}</td>'
                         f'<td>{apiver}</td>'
                         f'<td>{sens_badge}</td>'
                         f'</tr>\n'
@@ -3613,7 +3622,7 @@ class AzureDiscovery:
   <div class="modal-box">
     <button class="modal-close" onclick="closeModal('{rid}')">&times;</button>
     <h2>{rname}</h2>
-    <p style="color:#666;margin:0 0 12px">{rtype} &bull; {rloc} &bull; {sub_name} / {rg_name}</p>
+    <p style="color:#666;margin:0 0 12px">{rtype_h} &bull; {rloc} &bull; {sub_name} / {rg_name_h}</p>
     <div class="tabs">
       <button class="tab active" onclick="switchTab(this,'{rid}_arm')">ARM Template</button>
       <button class="tab" onclick="switchTab(this,'{rid}_props')">Full Properties</button>
