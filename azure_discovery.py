@@ -202,7 +202,57 @@ def _add_dep_from_hint(hint, setting_key, app_name, source_type, sub_id, depende
 
 class AzureDiscovery:
     """Main Azure Discovery class"""
-    
+
+    # ── Comprehensive Azure endpoint patterns ────────────────────────────────
+    # Each tuple: (service_type_label, compiled_regex, capture_group_for_name)
+    # capture_group_for_name=0  → use full match (no meaningful account name)
+    # capture_group_for_name=1+ → extract that capture group as the service name
+    _AZURE_ENDPOINT_PATTERNS = [
+        ('Storage/Blob',          re.compile(r'([a-zA-Z0-9]{3,24})\.blob\.core\.windows\.net',       re.I), 1),
+        ('Storage/Queue',         re.compile(r'([a-zA-Z0-9]{3,24})\.queue\.core\.windows\.net',      re.I), 1),
+        ('Storage/Table',         re.compile(r'([a-zA-Z0-9]{3,24})\.table\.core\.windows\.net',      re.I), 1),
+        ('Storage/File',          re.compile(r'([a-zA-Z0-9]{3,24})\.file\.core\.windows\.net',       re.I), 1),
+        ('Storage/ADLS',          re.compile(r'([a-zA-Z0-9]{3,24})\.dfs\.core\.windows\.net',        re.I), 1),
+        ('SQL',                   re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])\.database\.windows\.net', re.I), 1),
+        ('CosmosDB',              re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,49})\.documents\.azure\.com',        re.I), 1),
+        ('CosmosDB/Mongo',        re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,49})\.mongo\.cosmos\.azure\.com',    re.I), 1),
+        ('CosmosDB/Cassandra',    re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,49})\.cassandra\.cosmos\.azure\.com', re.I), 1),
+        ('ServiceBus',            re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,49})\.servicebus\.windows\.net',      re.I), 1),
+        ('Redis',                 re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,49})\.redis\.cache\.windows\.net',   re.I), 1),
+        ('KeyVault',              re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,23})\.vault\.azure\.net',             re.I), 1),
+        ('AppService/Function',   re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,39})\.azurewebsites\.net',            re.I), 1),
+        ('ContainerRegistry',     re.compile(r'([a-zA-Z0-9]{5,50})\.azurecr\.io',                                re.I), 1),
+        ('CognitiveServices',     re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,63})\.cognitiveservices\.azure\.com',  re.I), 1),
+        ('OpenAI',                re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,63})\.openai\.azure\.com',           re.I), 1),
+        ('APIManagement',         re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,49})\.azure\-api\.net',              re.I), 1),
+        ('Search',                re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{1,59})\.search\.windows\.net',         re.I), 1),
+        ('IoTHub',                re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,49})\.azure\-devices\.net',           re.I), 1),
+        ('SignalR',               re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,62})\.service\.signalr\.net',        re.I), 1),
+        ('CDN',                   re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,49})\.azureedge\.net',                re.I), 1),
+        ('FrontDoor',             re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,63})\.azurefd\.net',                 re.I), 1),
+        ('Databricks',            re.compile(r'adb\-[a-zA-Z0-9\-]+\.azuredatabricks\.net',                     re.I), 0),
+        ('AppInsights/IKey',      re.compile(r'InstrumentationKey\s*=\s*([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', re.I), 1),
+        ('AppInsights/ConnStr',   re.compile(r'APPLICATIONINSIGHTS_CONNECTION_STRING\s*[=:\"\']', re.I), 0),
+        ('EventGrid',             re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,49})\.eventgrid\.azure\.net',        re.I), 1),
+        ('AzureML',               re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,63})\.azureml\.net',                 re.I), 1),
+        ('ServiceFabric',         re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,63})\.cloudapp\.azure\.com',         re.I), 1),
+        ('StorageConnStr',        re.compile(r'DefaultEndpointsProtocol=https?;AccountName=([a-z0-9]{3,24})',      re.I), 1),
+        ('EventHub/Entity',       re.compile(r'EntityPath=([^;"\s\'"]+)',                                        re.I), 1),
+        ('AzureFunctions/Host',   re.compile(r'([a-zA-Z0-9][a-zA-Z0-9\-]{0,39})\.azurefd\.net',                re.I), 1),
+        ('NotificationHub',       re.compile(r'Endpoint=sb://([a-zA-Z0-9][a-zA-Z0-9\-]{0,49})\.servicebus\.windows\.net', re.I), 1),
+    ]
+
+    # Azure SDK import/require patterns  (covers .NET, Python, JS/TS, Java)
+    _AZURE_SDK_IMPORT_PATTERNS = [
+        re.compile(r'^\s*using\s+(Azure\.[A-Za-z\.]+)\s*;',             re.M),   # C#
+        re.compile(r'^\s*from\s+(azure\.[a-z_.]+)\s+import',            re.M),   # Python
+        re.compile(r'^\s*import\s+(azure\.[a-z_.]+)',                    re.M),   # Python (direct)
+        re.compile(r'from\s+[\'"](\@azure/[a-z\-]+)[\'"]',             re.M),   # JS/TS ESM
+        re.compile(r'require\([\'"](\@azure/[a-z\-]+)[\'"]\)',          re.M),   # JS/TS CJS
+        re.compile(r'^\s*import\s+(com\.azure\.[a-z_.]+)',              re.M),   # Java
+        re.compile(r'^\s*import\s+(com\.microsoft\.azure\.[a-z_.]+)',  re.M),   # Java (old)
+    ]
+
     def __init__(self, config_file: str = "config.json"):
         """Initialize Azure Discovery"""
         self.config = self._load_config(config_file)
@@ -2006,6 +2056,27 @@ class AzureDiscovery:
                         'category': 'Package Dependency',
                         'details': {'version': pkg['version']}
                     })
+
+            # ── Line-by-line Azure service references (from full repo code scan) ──
+            seen_hits: Set[str] = set()
+            for hit in app_data.get('azure_service_hits', []):
+                # Deduplicate by (service_type, service_name, file)
+                dedup_key = f"{hit['service_type']}|{hit['service_name']}|{hit['file']}"
+                if dedup_key in seen_hits:
+                    continue
+                seen_hits.add(dedup_key)
+                app_dependencies.append({
+                    'application':    app_name,
+                    'dependency_name': hit['service_name'],
+                    'dependency_type': hit['service_type'],
+                    'source':         f"{hit['file']}:L{hit['line_no']}",
+                    'category':       'Azure Service Reference (Code)',
+                    'details': {
+                        'endpoint': hit['endpoint_match'],
+                        'context':  hit['context'],
+                        'repo':     hit.get('repo', app_name),
+                    }
+                })
         
         self.discovery_data['application_dependencies'] = app_dependencies
         self.logger.info(f"\n✓ Mapped {len(app_dependencies)} application dependencies")
@@ -2207,28 +2278,89 @@ class AzureDiscovery:
             except Exception as ls_err:
                 self.logger.warning(f"      Preflight check skipped: {ls_err}")
 
-            # ── Clone / pull ─────────────────────────────────────────────────
+            # ── Step 1: Clone / pull repo first ───────────────────────────────
+            clone_ok = False
             try:
                 self._clone_repo_with_ssl_fallback(repo_url, repo_path, repo_branch)
-                self.logger.info(f"      Scanning code...")
+                clone_ok = True
+                self.logger.info(f"      Repository ready at: {repo_path}")
+            except git.exc.GitCommandError as git_err:
+                err_str = str(git_err)
+                sep = '='*64
+                self.logger.error(f"")
+                self.logger.error(f"  {sep}")
+                self.logger.error(f"  CLONE FAILED : {safe_url}")
+                self.logger.error(f"  {sep}")
+                if '401' in err_str or '403' in err_str or 'authentication' in err_str.lower() or 'credential' in err_str.lower():
+                    self.logger.error(f"  ERROR TYPE   : Authentication / Authorization failure (HTTP 401/403)")
+                    self.logger.error(f"  WHAT HAPPENED: Git rejected the credentials embedded in the URL.")
+                    self.logger.error(f"  HOW TO FIX   :")
+                    self.logger.error(f"    1. Go to Azure DevOps -> User Settings -> Personal Access Tokens")
+                    self.logger.error(f"    2. Create or renew a PAT with scope: Code (Read)")
+                    self.logger.error(f"    3. In config.json set  azure_devops.pat_token  to the new token value")
+                    self.logger.error(f"    4. Confirm azure_devops.organization matches your DevOps org name exactly")
+                elif '404' in err_str or 'not found' in err_str.lower() or 'repository not found' in err_str.lower() or 'does not exist' in err_str.lower():
+                    self.logger.error(f"  ERROR TYPE   : Repository / path not found (HTTP 404)")
+                    self.logger.error(f"  WHAT HAPPENED: The URL does not resolve to an existing repository.")
+                    self.logger.error(f"  HOW TO FIX   :")
+                    self.logger.error(f"    1. In config.json verify  azure_devops.organization  (exact spelling)")
+                    self.logger.error(f"    2. Verify  projects[].project_name  (exact spelling, case-sensitive)")
+                    self.logger.error(f"    3. Verify  repositories[].name      (exact spelling)")
+                    self.logger.error(f"    4. Confirm the repo exists at: Azure DevOps -> Repos")
+                elif 'ssl' in err_str.lower() or 'certificate' in err_str.lower() or 'cert' in err_str.lower():
+                    self.logger.error(f"  ERROR TYPE   : SSL / TLS certificate verification error")
+                    self.logger.error(f"  WHAT HAPPENED: Git cannot verify the server's TLS certificate.")
+                    self.logger.error(f"  HOW TO FIX   :")
+                    self.logger.error(f"    Run:  git config --global http.sslBackend schannel   (recommended on Windows)")
+                    self.logger.error(f"    OR :  git config --global http.sslVerify false        (insecure fallback)")
+                elif 'timeout' in err_str.lower() or 'timed out' in err_str.lower():
+                    self.logger.error(f"  ERROR TYPE   : Network / connection timeout")
+                    self.logger.error(f"  WHAT HAPPENED: Git could not reach the server within the timeout limit.")
+                    self.logger.error(f"  HOW TO FIX   :")
+                    self.logger.error(f"    1. Check internet connectivity and corporate VPN / proxy settings")
+                    self.logger.error(f"    2. Test manually: git ls-remote {safe_url}")
+                else:
+                    self.logger.error(f"  ERROR TYPE   : Unexpected git error")
+                    self.logger.error(f"  DETAILS      : {err_str[:500]}")
+                    self.logger.error(f"  HOW TO FIX   :")
+                    self.logger.error(f"    Test manually: git clone {safe_url}")
+                    self.logger.error(f"    Ensure 'git' is installed and available in PATH")
+                self.logger.error(f"  {sep}")
+                self.logger.error(f"  Skipping code scan for this repository.")
+                self.logger.error(f"  {sep}")
+                failed += 1
+                continue
+            except Exception as clone_generic_err:
+                sep = '='*64
+                self.logger.error(f"")
+                self.logger.error(f"  {sep}")
+                self.logger.error(f"  CLONE FAILED : {safe_url}")
+                self.logger.error(f"  REASON       : {str(clone_generic_err)[:500]}")
+                self.logger.error(f"  Ensure 'git' is installed and the URL is reachable.")
+                self.logger.error(f"  {sep}")
+                failed += 1
+                continue
+
+            # ── Step 2: Scan code (only runs when clone succeeded) ────────────
+            try:
+                self.logger.info(f"      Scanning repository line by line for Azure service dependencies...")
                 self.scan_repository_code(repo_path, repo_name)
                 scanned += 1
                 self.logger.info(f"      Done - {repo_name}")
-            except Exception as e:
-                err_str = str(e)
-                self.logger.error(f"      !! Clone/scan failed: {err_str[:400]}")
-                if '401' in err_str or '403' in err_str:
-                    self.logger.error(f"         -> Authentication error. Check PAT token in config.json.")
-                elif '404' in err_str or 'not found' in err_str.lower():
-                    self.logger.error(f"         -> Repository not found. Check org/project/repo names.")
-                elif 'ssl' in err_str.lower() or 'certificate' in err_str.lower():
-                    self.logger.error(f"         -> SSL error. Run: git config --global http.sslBackend schannel")
+            except Exception as scan_err:
+                self.logger.error(f"      !! Code scan failed for {repo_name}: {scan_err}")
                 failed += 1
 
         self.logger.info(f"\n  Code scanning complete: {scanned} succeeded, {failed} failed out of {len(repos)} repo(s)")
     
     def scan_repository_code(self, repo_path, repo_name):
-        """Scan repository code for dependencies and configurations"""
+        """Scan repository code for Azure service dependencies and configurations.
+        
+        Performs three passes:
+        1. ARM / Bicep template analysis
+        2. .NET project file + appsettings analysis
+        3. Full line-by-line scan of every file for Azure endpoint / SDK references
+        """
         self.logger.info(f"  Scanning code in {repo_name}...")
         
         app_data = {
@@ -2245,21 +2377,30 @@ class AzureDiscovery:
             'database_connections': [],
             'azure_sdk_usage': [],
             'api_endpoints': [],
-            'dependency_graph': {}
+            'dependency_graph': {},
+            'azure_service_hits': []   # line-by-line Azure service references
         }
         
-        # Scan for ARM templates
-        self.logger.info(f"    Scanning for ARM templates...")
+        # Pass 1: ARM / Bicep templates
+        self.logger.info(f"    Pass 1/3 - Scanning for ARM / Bicep templates...")
         arm_templates = self.scan_arm_templates(repo_path)
         app_data['arm_templates'] = arm_templates
         self.discovery_data['arm_templates'].extend(arm_templates)
         
-        # Scan .NET code
-        self.logger.info(f"    Scanning .NET code...")
+        # Pass 2: .NET project files, appsettings, web.config
+        self.logger.info(f"    Pass 2/3 - Scanning .NET project / config files...")
         dotnet_analysis = self.scan_dotnet_code(repo_path, repo_name)
         app_data.update(dotnet_analysis)
         
-        # General pattern scanning
+        # Pass 3: Line-by-line scan of ALL file types
+        self.logger.info(f"    Pass 3/3 - Full repository line-by-line scan...")
+        line_hits, files_count, lines_count = self.scan_repo_line_by_line(repo_path, repo_name)
+        app_data['azure_service_hits'] = line_hits
+        # Use max so we don't under-count when dotnet scan already walked some files
+        app_data['files_scanned'] = max(app_data.get('files_scanned', 0), files_count)
+        app_data['lines_scanned'] = max(app_data.get('lines_scanned', 0), lines_count)
+        
+        # General pattern scanning (external URLs, SMTP, api-keys)
         findings = self.scan_code_patterns(repo_path)
         app_data['findings'] = findings
         
@@ -2271,17 +2412,169 @@ class AzureDiscovery:
         # Store application data
         self.discovery_data['applications'][repo_name] = app_data
         self.discovery_data['code_inventory'][repo_name] = {
-            'files': app_data['files_scanned'],
-            'lines': app_data['lines_scanned'],
-            'dependencies': len(app_data['external_dependencies']),
-            'azure_resources': len(app_data['azure_sdk_usage'])
+            'files':             app_data['files_scanned'],
+            'lines':             app_data['lines_scanned'],
+            'dependencies':      len(app_data['external_dependencies']),
+            'azure_resources':   len(app_data['azure_sdk_usage']),
+            'azure_service_refs': len(line_hits)
         }
         
-        self.logger.info(f"    ✓ Scanned {app_data['files_scanned']} files, {app_data['lines_scanned']} lines")
-        self.logger.info(f"    ✓ Found {len(arm_templates)} ARM templates")
-        self.logger.info(f"    ✓ Found {len(app_data['nuget_packages'])} NuGet packages")
-    
-    def scan_arm_templates(self, repo_path):
+        self.logger.info(f"    Scanned {app_data['files_scanned']} files, {app_data['lines_scanned']:,} lines")
+        self.logger.info(f"    Found {len(arm_templates)} ARM/Bicep templates")
+        self.logger.info(f"    Found {len(app_data['nuget_packages'])} NuGet packages")
+        self.logger.info(f"    Found {len(line_hits)} Azure service references in source code")
+
+    def scan_repo_line_by_line(self, repo_path: str, repo_name: str):
+        """Scan every file in the repository line-by-line for Azure service references.
+
+        Covers all common source-code and config file types (C#, Python, JS/TS,
+        Java, Go, YAML, JSON, XML, .env, Terraform, Bicep, PowerShell, etc.).
+        For each line that matches a known Azure endpoint pattern or SDK import,
+        records the exact file path, 1-based line number, matched service type,
+        extracted service name, full endpoint token, and a sanitised line snippet.
+
+        Returns:
+            (hits, files_scanned, lines_scanned)
+            hits             – list[dict] with keys:
+                               repo, file, line_no, service_type, service_name,
+                               endpoint_match, context
+            files_scanned    – int
+            lines_scanned    – int
+        """
+        SCANNABLE_EXTENSIONS = {
+            # .NET
+            '.cs', '.vb', '.fs', '.csproj', '.vbproj', '.fsproj',
+            # Python
+            '.py',
+            # JavaScript / TypeScript
+            '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs',
+            # Java / Kotlin / Scala
+            '.java', '.kt', '.scala',
+            # Go
+            '.go',
+            # PHP / Ruby
+            '.php', '.rb',
+            # Data / Config
+            '.json', '.jsonc',
+            '.yaml', '.yml',
+            '.xml', '.config',
+            '.env', '.env.local', '.env.production', '.env.staging',
+            '.properties', '.ini', '.toml',
+            # Infrastructure as Code
+            '.tf', '.tfvars', '.hcl',
+            '.bicep',
+            # Shell / scripting
+            '.sh', '.bash',
+            '.ps1', '.psm1', '.psd1',
+        }
+        SCANNABLE_NAMES = {
+            'dockerfile', '.env', '.envrc', 'procfile',
+            'requirements.txt', 'package.json', 'appsettings.json',
+        }
+        SKIP_DIRS = {
+            '.git', 'node_modules', 'bin', 'obj', '__pycache__',
+            'dist', 'build', '.vs', 'packages', '.terraform',
+            'vendor', '.idea', '.vscode', 'target', 'out', 'coverage',
+        }
+
+        hits          = []
+        files_scanned = 0
+        lines_scanned = 0
+
+        for root, dirs, files in os.walk(repo_path):
+            # Prune skip directories in-place to avoid descending
+            dirs[:] = [
+                d for d in dirs
+                if d.lower() not in SKIP_DIRS and not d.startswith('.git')
+            ]
+
+            for filename in files:
+                ext = os.path.splitext(filename)[1].lower()
+                if ext not in SCANNABLE_EXTENSIONS and filename.lower() not in SCANNABLE_NAMES:
+                    continue
+
+                file_path = os.path.join(root, filename)
+                rel_path  = os.path.relpath(file_path, repo_path).replace('\\', '/')
+
+                try:
+                    with open(file_path, 'r', encoding='utf-8', errors='replace') as fh:
+                        files_scanned += 1
+                        for line_no, raw_line in enumerate(fh, start=1):
+                            lines_scanned += 1
+                            line = raw_line.rstrip('\n')
+
+                            # ── Azure endpoint pattern matching ──────────────
+                            for svc_type, pattern, name_grp in self._AZURE_ENDPOINT_PATTERNS:
+                                for m in pattern.finditer(line):
+                                    if name_grp and name_grp <= len(m.groups()):
+                                        svc_name = m.group(name_grp)
+                                    else:
+                                        svc_name = m.group(0)
+                                    # Sanitise context: mask likely secret values
+                                    ctx = line[:250].strip()
+                                    ctx = re.sub(
+                                        r'(key|secret|password|pwd|token|connectionstring)'
+                                        r'\s*[=:]\s*["\']?[A-Za-z0-9+/=]{8,}',
+                                        r'\1=***', ctx, flags=re.I
+                                    )
+                                    hits.append({
+                                        'repo':           repo_name,
+                                        'file':           rel_path,
+                                        'line_no':        line_no,
+                                        'service_type':   svc_type,
+                                        'service_name':   svc_name,
+                                        'endpoint_match': m.group(0),
+                                        'context':        ctx,
+                                    })
+
+                            # ── Azure SDK import matching ──────────────────
+                            for sdk_pattern in self._AZURE_SDK_IMPORT_PATTERNS:
+                                for m in sdk_pattern.finditer(line):
+                                    sdk_name = (
+                                        m.group(1)
+                                        if m.lastindex and m.lastindex >= 1
+                                        else m.group(0)
+                                    )
+                                    hits.append({
+                                        'repo':           repo_name,
+                                        'file':           rel_path,
+                                        'line_no':        line_no,
+                                        'service_type':   'Azure SDK Import',
+                                        'service_name':   sdk_name,
+                                        'endpoint_match': m.group(0).strip(),
+                                        'context':        line[:250].strip(),
+                                    })
+
+                except PermissionError:
+                    self.logger.debug(f"Permission denied: {rel_path} - skipping")
+                except Exception as read_err:
+                    self.logger.debug(f"Cannot read {rel_path}: {read_err} - skipping")
+
+        # ── Per-service-type summary log ──────────────────────────────────
+        by_type: Dict[str, int] = defaultdict(int)
+        by_name: Dict[str, Set[str]] = defaultdict(set)
+        for h in hits:
+            stype = h['service_type']
+            sname = h['service_name']
+            by_type[stype] += 1
+            by_name[stype].add(sname)
+
+        self.logger.info(
+            f"    Line-by-line scan complete: {files_scanned} files, "
+            f"{lines_scanned:,} lines, {len(hits)} Azure refs found"
+        )
+        if by_type:
+            self.logger.info("    Azure service references by type:")
+            for svc, cnt in sorted(by_type.items(), key=lambda x: -x[1]):
+                names_preview = ', '.join(sorted(by_name[svc])[:5])
+                if len(by_name[svc]) > 5:
+                    names_preview += f" ... (+{len(by_name[svc])-5} more)"
+                self.logger.info(f"      {svc:<30}: {cnt:>4} ref(s)  [{names_preview}]")
+        else:
+            self.logger.info("    No Azure service references detected in code.")
+
+        return hits, files_scanned, lines_scanned
+
         """Scan for and analyze ARM templates"""
         arm_templates = []
         
@@ -2712,7 +3005,12 @@ class AzureDiscovery:
                 continue
             
             for file in files:
-                if not any(file.endswith(ext) for ext in ['.cs', '.json', '.config', '.xml']):
+                if not any(file.endswith(ext) for ext in [
+                    '.cs', '.vb', '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.go',
+                    '.php', '.rb', '.json', '.yml', '.yaml', '.config', '.xml',
+                    '.tf', '.bicep', '.hcl', '.sh', '.ps1', '.psm1',
+                    '.properties', '.env', '.toml', '.ini',
+                ]) and file.lower() not in {'dockerfile', '.env', '.envrc', 'procfile'}:
                     continue
                 
                 file_path = os.path.join(root, file)
@@ -2803,8 +3101,8 @@ class AzureDiscovery:
         with open(html_file, 'w', encoding='utf-8') as f:
             f.write(html_content)
         
-        self.logger.info(f"✓ HTML report generated: {html_file}")
-        
+        self.logger.info(f"\u2713 HTML report generated: {html_file}")
+
         # Also generate basic HTML for compatibility
         basic_html_file = os.path.join(self.config['output_dir'], 
                                 f"azure_discovery_basic_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html")
@@ -3112,7 +3410,10 @@ class AzureDiscovery:
         # Add subscription details
         for sub_id, sub_data in self.discovery_data['subscriptions'].items():
             html += self._generate_subscription_html(sub_id, sub_data)
-        
+
+        # Add resource groups inventory section
+        html += self._generate_resource_groups_html()
+
         # Add application dependencies section
         html += self._generate_application_dependencies_html()
         
@@ -3154,6 +3455,370 @@ class AzureDiscovery:
 """
         return html
     
+    def _generate_resource_groups_html(self):
+        """Generate a full Resource Group → Resources inventory section."""
+        # Colour map: one stable colour per Azure resource type prefix (Microsoft.XXX)
+        TYPE_COLOURS = {
+            'microsoft.compute':          '#0078d4',
+            'microsoft.web':              '#7719aa',
+            'microsoft.sql':              '#d83b01',
+            'microsoft.storage':          '#107c10',
+            'microsoft.keyvault':         '#c19c00',
+            'microsoft.network':          '#00b7c3',
+            'microsoft.servicebus':       '#e81123',
+            'microsoft.eventhub':         '#ff8c00',
+            'microsoft.cosmosdb':         '#008272',
+            'microsoft.cache':            '#498205',
+            'microsoft.insights':         '#b4009e',
+            'microsoft.containerservice': '#004e8c',
+            'microsoft.containerregistry':'#004e8c',
+            'microsoft.databricks':       '#0e7a0d',
+            'microsoft.datafactory':      '#881798',
+            'microsoft.cognitiveservices':'#038387',
+            'microsoft.search':           '#004b1c',
+            'microsoft.cdn':              '#004e8c',
+            'microsoft.documentdb':       '#008272',
+        }
+
+        def rtype_colour(rtype: str) -> str:
+            prefix = '/'.join(rtype.lower().split('/')[:1])
+            for k, v in TYPE_COLOURS.items():
+                if prefix.startswith(k):
+                    return v
+            return '#605e5c'
+
+        def rtype_short(rtype: str) -> str:
+            """Return last segment of resource type for a compact badge label."""
+            parts = rtype.split('/')
+            return parts[-1] if parts else rtype
+
+        def tags_html(tags: dict) -> str:
+            if not tags:
+                return '<span style="color:#999;font-size:11px">—</span>'
+            return ' '.join(
+                f'<span style="background:#f0f0f0;border:1px solid #ccc;border-radius:3px;'
+                f'padding:1px 5px;font-size:11px;color:#333">{k}={v}</span>'
+                for k, v in list(tags.items())[:6]
+            ) + (f' <span style="color:#999;font-size:11px">(+{len(tags)-6} more)</span>' if len(tags) > 6 else '')
+
+        html = '''
+        <div class="section" id="rg-inventory">
+            <h2>&#128193; Resource Group Inventory</h2>
+            <p>All resource groups discovered across subscriptions, with every resource listed under its group.
+               Data reflects the live Azure Resource Manager output at discovery time.</p>
+'''
+        grand_rg_total   = 0
+        grand_res_total  = 0
+
+        for sub_id, sub_data in self.discovery_data['subscriptions'].items():
+            rgs = sub_data.get('resource_groups', {})
+            all_sub_res = sum(len(rg.get('resources', [])) for rg in rgs.values())
+            grand_rg_total  += len(rgs)
+            grand_res_total += all_sub_res
+
+            html += f'''
+            <button class="collapsible">
+                &#128196; Subscription: {sub_data["name"]}
+                &nbsp;<span style="font-weight:normal;font-size:13px">
+                    ({len(rgs)} resource groups &middot; {all_sub_res} resources)
+                </span>
+            </button>
+            <div class="collapsible-content">
+'''
+
+            if not rgs:
+                html += '<div class="info">No resource groups found in this subscription.</div>'
+            else:
+                for rg_name, rg_data in sorted(rgs.items()):
+                    resources = rg_data.get('resources', [])
+                    # Count by type
+                    type_counts: Dict[str, int] = defaultdict(int)
+                    for r in resources:
+                        type_counts[r.get('type', 'Unknown')] += 1
+
+                    html += f'''
+                <button class="collapsible" style="margin-left:20px;background:#f5f5f5;color:#333;font-size:13px">
+                    &#128200; {rg_name}
+                    &nbsp;<small>({rg_data.get("location","?")} &middot; {len(resources)} resource(s))</small>
+                </button>
+                <div class="collapsible-content" style="margin-left:20px">
+                    <div style="margin-bottom:8px">
+                        <strong>Location:</strong> {rg_data.get("location","N/A")}&nbsp;&nbsp;
+                        <strong>Tags:</strong> {tags_html(rg_data.get("tags",{}))}
+                    </div>
+                    <div style="margin-bottom:10px">
+'''
+                    for rtype, cnt in sorted(type_counts.items(), key=lambda x: -x[1]):
+                        colour = rtype_colour(rtype)
+                        html += (f'<span style="background:{colour};color:#fff;border-radius:4px;'
+                                 f'padding:2px 8px;font-size:11px;margin:2px 4px 2px 0;display:inline-block">'
+                                 f'{rtype_short(rtype)}&nbsp;({cnt})</span>')
+
+                    html += '''
+                    </div>
+'''
+                    if resources:
+                        html += '''
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Resource Name</th>
+                                <th>Type</th>
+                                <th>Location</th>
+                                <th>Tags</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+'''
+                        for idx, res in enumerate(sorted(resources, key=lambda x: (x.get('type',''), x.get('name',''))), start=1):
+                            colour = rtype_colour(res.get('type', ''))
+                            html += f'''
+                            <tr>
+                                <td style="color:#999;font-size:11px">{idx}</td>
+                                <td><strong>{res.get("name","?")}</strong></td>
+                                <td><span style="background:{colour};color:#fff;border-radius:4px;
+                                    padding:2px 7px;font-size:11px">{res.get("type","?")}</span></td>
+                                <td>{res.get("location","N/A")}</td>
+                                <td>{tags_html(res.get("tags",{}))}</td>
+                            </tr>
+'''
+                        html += '''
+                        </tbody>
+                    </table>
+'''
+                    else:
+                        html += '<div class="info" style="margin:8px 0">No resources in this resource group.</div>'
+
+                    html += '''
+                </div>
+'''
+            html += '''
+            </div>
+'''
+
+        html += f'''
+            <div style="margin-top:16px;padding:12px 18px;background:#f0f6ff;
+                        border-left:4px solid #0078d4;border-radius:4px;font-size:13px">
+                <strong>Grand Total:</strong>&nbsp;
+                {grand_rg_total} resource group(s) across all subscriptions,
+                {grand_res_total} total resource(s).
+            </div>
+        </div>
+'''
+        return html
+
+    def generate_resource_groups_report(self):
+        """Generate a self-contained standalone HTML report: Resource Groups + Resources."""
+        self.logger.info("Generating Resource Group Inventory report...")
+        ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
+        path = os.path.join(self.config['output_dir'],
+                            f'resource_groups_inventory_{ts}.html')
+
+        def rtype_colour(rtype: str) -> str:
+            TYPE_COLOURS = {
+                'microsoft.compute':          '#0078d4',
+                'microsoft.web':              '#7719aa',
+                'microsoft.sql':              '#d83b01',
+                'microsoft.storage':          '#107c10',
+                'microsoft.keyvault':         '#c19c00',
+                'microsoft.network':          '#00b7c3',
+                'microsoft.servicebus':       '#e81123',
+                'microsoft.eventhub':         '#ff8c00',
+                'microsoft.cosmosdb':         '#008272',
+                'microsoft.cache':            '#498205',
+                'microsoft.insights':         '#b4009e',
+                'microsoft.containerservice': '#004e8c',
+                'microsoft.containerregistry':'#004e8c',
+                'microsoft.databricks':       '#0e7a0d',
+                'microsoft.datafactory':      '#881798',
+                'microsoft.cognitiveservices':'#038387',
+                'microsoft.search':           '#004b1c',
+                'microsoft.cdn':              '#004e8c',
+                'microsoft.documentdb':       '#008272',
+            }
+            prefix = '/'.join(rtype.lower().split('/')[:1])
+            for k, v in TYPE_COLOURS.items():
+                if prefix.startswith(k):
+                    return v
+            return '#605e5c'
+
+        # ── collect grand totals ────────────────────────────────────────
+        grand_subs = 0
+        grand_rgs  = 0
+        grand_res  = 0
+        all_types: Dict[str, int] = defaultdict(int)
+        for sub_data in self.discovery_data['subscriptions'].values():
+            grand_subs += 1
+            for rg_data in sub_data.get('resource_groups', {}).values():
+                grand_rgs += 1
+                for r in rg_data.get('resources', []):
+                    grand_res += 1
+                    all_types[r.get('type', 'Unknown')] += 1
+
+        top_types_html = ''.join(
+            f'<tr><td>{t}</td><td style="text-align:right">{c}</td></tr>'
+            for t, c in sorted(all_types.items(), key=lambda x: -x[1])[:20]
+        )
+
+        # ── build body rows ─────────────────────────────────────────────
+        body_rows = ''
+        row_num = 0
+        for sub_data in self.discovery_data['subscriptions'].values():
+            sub_name = sub_data['name']
+            for rg_name, rg_data in sorted(sub_data.get('resource_groups', {}).items()):
+                rg_loc  = rg_data.get('location', 'N/A')
+                rg_tags = '; '.join(f'{k}={v}' for k, v in (rg_data.get('tags') or {}).items())
+                resources = rg_data.get('resources', [])
+                if not resources:
+                    row_num += 1
+                    stripe = '#fafafa' if row_num % 2 == 0 else '#fff'
+                    body_rows += f'''
+                    <tr style="background:{stripe}">
+                        <td>{sub_name}</td>
+                        <td><strong>{rg_name}</strong></td>
+                        <td style="color:#999">{rg_loc}</td>
+                        <td style="color:#999">— (empty resource group)</td>
+                        <td></td>
+                        <td></td>
+                        <td style="font-size:11px;color:#777">{rg_tags}</td>
+                    </tr>'''
+                else:
+                    for res in sorted(resources, key=lambda x: (x.get('type',''), x.get('name',''))):
+                        row_num += 1
+                        stripe = '#fafafa' if row_num % 2 == 0 else '#fff'
+                        colour = rtype_colour(res.get('type', ''))
+                        res_tags = '; '.join(f'{k}={v}' for k, v in (res.get('tags') or {}).items())
+                        body_rows += f'''
+                    <tr style="background:{stripe}">
+                        <td>{sub_name}</td>
+                        <td><strong>{rg_name}</strong></td>
+                        <td>{rg_loc}</td>
+                        <td>{res.get("name","?")}</td>
+                        <td><span style="background:{colour};color:#fff;border-radius:3px;padding:1px 7px;font-size:11px">{res.get("type","?")}</span></td>
+                        <td>{res.get("location","N/A")}</td>
+                        <td style="font-size:11px;color:#555">{res_tags}</td>
+                    </tr>'''
+
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Azure Resource Group Inventory</title>
+<style>
+  * {{ box-sizing:border-box; margin:0; padding:0; }}
+  body {{ font-family:"Segoe UI",Arial,sans-serif; font-size:13px;
+          background:#f4f6f9; color:#333; }}
+  header {{ background:#0078d4; color:#fff; padding:20px 32px; }}
+  header h1 {{ font-size:22px; font-weight:600; }}
+  header p  {{ font-size:12px; opacity:.85; margin-top:4px; }}
+  .container {{ max-width:1400px; margin:0 auto; padding:24px 32px; }}
+  .stat-bar {{ display:flex; gap:16px; flex-wrap:wrap; margin-bottom:24px; }}
+  .stat {{ background:#fff; border-radius:8px; border-left:4px solid #0078d4;
+           padding:12px 20px; min-width:160px; box-shadow:0 1px 3px rgba(0,0,0,.08); }}
+  .stat .num {{ font-size:26px; font-weight:700; color:#0078d4; }}
+  .stat .lbl {{ font-size:11px; color:#777; text-transform:uppercase; letter-spacing:.5px; }}
+  .panel {{ background:#fff; border-radius:8px; padding:20px 24px;
+            margin-bottom:24px; box-shadow:0 1px 3px rgba(0,0,0,.08); }}
+  .panel h2 {{ font-size:15px; font-weight:600; margin-bottom:14px;
+               border-bottom:1px solid #eee; padding-bottom:8px; }}
+  table {{ width:100%; border-collapse:collapse; font-size:12px; }}
+  th {{ background:#0078d4; color:#fff; padding:8px 10px; text-align:left; font-weight:600; }}
+  td {{ padding:6px 10px; border-bottom:1px solid #f0f0f0; vertical-align:top; }}
+  tr:hover td {{ background:#e8f3ff !important; }}
+  .filter-bar {{ display:flex; gap:10px; margin-bottom:14px; flex-wrap:wrap; }}
+  .filter-bar input, .filter-bar select {{
+      padding:6px 10px; border:1px solid #ccc; border-radius:5px;
+      font-size:12px; outline:none;
+  }}
+  .filter-bar input:focus {{ border-color:#0078d4; }}
+  #rowCount {{ font-size:12px; color:#666; align-self:center; margin-left:auto; }}
+  footer {{ text-align:center; color:#aaa; font-size:11px; padding:20px; }}
+</style>
+</head>
+<body>
+<header>
+  <h1>&#128193; Azure Resource Group Inventory</h1>
+  <p>Generated: {now_str} &nbsp;|&nbsp;
+     {grand_subs} subscription(s) &nbsp;|&nbsp;
+     {grand_rgs} resource group(s) &nbsp;|&nbsp;
+     {grand_res} resource(s)</p>
+</header>
+<div class="container">
+
+  <!-- Stat bar -->
+  <div class="stat-bar">
+    <div class="stat"><div class="num">{grand_subs}</div><div class="lbl">Subscriptions</div></div>
+    <div class="stat"><div class="num">{grand_rgs}</div><div class="lbl">Resource Groups</div></div>
+    <div class="stat"><div class="num">{grand_res}</div><div class="lbl">Total Resources</div></div>
+    <div class="stat"><div class="num">{len(all_types)}</div><div class="lbl">Distinct Types</div></div>
+  </div>
+
+  <!-- Top types panel -->
+  <div class="panel">
+    <h2>Top Resource Types</h2>
+    <table style="width:auto;min-width:340px">
+      <thead><tr><th>Resource Type</th><th>Count</th></tr></thead>
+      <tbody>{top_types_html}</tbody>
+    </table>
+  </div>
+
+  <!-- Full inventory table -->
+  <div class="panel">
+    <h2>Full Inventory</h2>
+    <div class="filter-bar">
+      <input id="search" placeholder="&#128269; Filter by name, type, RG..." style="flex:1;min-width:200px">
+      <span id="rowCount"></span>
+    </div>
+    <table id="invTable">
+      <thead>
+        <tr>
+          <th>Subscription</th>
+          <th>Resource Group</th>
+          <th>RG Location</th>
+          <th>Resource Name</th>
+          <th>Resource Type</th>
+          <th>Resource Location</th>
+          <th>Tags</th>
+        </tr>
+      </thead>
+      <tbody id="invBody">
+        {body_rows}
+      </tbody>
+    </table>
+  </div>
+
+</div>
+<footer>Azure Discovery Tool &mdash; Resource Group Inventory &mdash; {now_str}</footer>
+<script>
+(function(){{
+  var rows = Array.from(document.querySelectorAll('#invBody tr'));
+  var countEl = document.getElementById('rowCount');
+  function updateCount(n) {{ countEl.textContent = n + ' / ' + rows.length + ' rows'; }}
+  updateCount(rows.length);
+  document.getElementById('search').addEventListener('input', function(){{
+    var q = this.value.toLowerCase();
+    var shown = 0;
+    rows.forEach(function(r){{
+      var txt = r.textContent.toLowerCase();
+      var vis = !q || txt.includes(q);
+      r.style.display = vis ? '' : 'none';
+      if(vis) shown++;
+    }});
+    updateCount(shown);
+  }});
+}})();
+</script>
+</body>
+</html>'''
+
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(html)
+        self.logger.info(f'  Resource Group report: {path}')
+        return path
+
     def _generate_subscription_html(self, sub_id, sub_data):
         """Generate HTML for subscription details"""
         html = f"""
@@ -3917,6 +4582,7 @@ class AzureDiscovery:
         
         # Create sheets
         self._create_summary_sheet(wb)
+        self._create_resource_groups_sheet(wb)
         self._create_application_dependencies_sheet(wb)
         self._create_arm_templates_sheet(wb)
         self._create_code_inventory_sheet(wb)
@@ -3933,6 +4599,100 @@ class AzureDiscovery:
         self.logger.info(f"✓ Excel report generated: {excel_file}")
         return excel_file
     
+    def _create_resource_groups_sheet(self, wb):
+        """Create a Resource Group → Resources inventory sheet."""
+        ws = wb.create_sheet("Resource Groups")
+
+        headers = [
+            "Subscription", "Resource Group", "RG Location", "RG Tags",
+            "Resource Name", "Resource Type", "Resource Location", "Resource Tags"
+        ]
+        HDR_FILL  = PatternFill(start_color="0078D4", end_color="0078D4", fill_type="solid")
+        HDR_FONT  = Font(bold=True, color="FFFFFF", size=11)
+        ALT_FILLS = [
+            PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid"),
+            PatternFill(start_color="F0F6FF", end_color="F0F6FF", fill_type="solid"),
+        ]
+        RG_HEADER_FILL = PatternFill(start_color="DEECF9", end_color="DEECF9", fill_type="solid")
+        RG_FONT        = Font(bold=True, size=11, color="004578")
+        EMPTY_FILL     = PatternFill(start_color="FAFAFA", end_color="FAFAFA", fill_type="solid")
+        WRAP           = Alignment(wrap_text=True, vertical="top")
+        THIN_BORDER    = Border(
+            bottom=Side(style='thin', color='D0D0D0'),
+            right=Side(style='thin', color='D0D0D0')
+        )
+
+        # ── Header row ───────────────────────────────────────────────────
+        for col_idx, hdr in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_idx, value=hdr)
+            cell.font   = HDR_FONT
+            cell.fill   = HDR_FILL
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.freeze_panes = 'A2'
+        ws.row_dimensions[1].height = 18
+
+        row = 2
+        rg_colour_idx = 0  # alternates per RG for visual grouping
+
+        for sub_data in self.discovery_data['subscriptions'].values():
+            sub_name = sub_data['name']
+            for rg_name, rg_data in sorted(sub_data.get('resource_groups', {}).items()):
+                rg_loc  = rg_data.get('location', 'N/A')
+                rg_tags = '; '.join(f'{k}={v}' for k, v in (rg_data.get('tags') or {}).items())
+                resources = sorted(
+                    rg_data.get('resources', []),
+                    key=lambda x: (x.get('type', ''), x.get('name', ''))
+                )
+
+                rg_colour_idx += 1
+                alt_fill = ALT_FILLS[rg_colour_idx % 2]
+
+                if not resources:
+                    # Empty RG — one placeholder row
+                    vals = [sub_name, rg_name, rg_loc, rg_tags,
+                            '(empty)', '', '', '']
+                    for col_idx, val in enumerate(vals, 1):
+                        cell = ws.cell(row=row, column=col_idx, value=val)
+                        cell.fill      = EMPTY_FILL
+                        cell.alignment = WRAP
+                        cell.border    = THIN_BORDER
+                        if col_idx <= 4:
+                            cell.font  = Font(italic=True, color='888888')
+                    row += 1
+                else:
+                    for res_data in resources:
+                        res_tags = '; '.join(
+                            f'{k}={v}' for k, v in (res_data.get('tags') or {}).items()
+                        )
+                        vals = [
+                            sub_name,
+                            rg_name,
+                            rg_loc,
+                            rg_tags,
+                            res_data.get('name', ''),
+                            res_data.get('type', ''),
+                            res_data.get('location', 'N/A'),
+                            res_tags,
+                        ]
+                        for col_idx, val in enumerate(vals, 1):
+                            cell = ws.cell(row=row, column=col_idx, value=val)
+                            cell.fill      = alt_fill
+                            cell.alignment = WRAP
+                            cell.border    = THIN_BORDER
+                            if col_idx == 2:  # RG name bold
+                                cell.font = Font(bold=True)
+                            elif col_idx == 5:  # Resource name
+                                cell.font = Font(bold=False)
+                        row += 1
+
+        # ── Column widths ────────────────────────────────────────────────
+        col_widths = [28, 30, 18, 40, 36, 50, 18, 50]
+        for col_idx, width in enumerate(col_widths, 1):
+            ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+        # ── Auto-filter ──────────────────────────────────────────────────
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{row - 1}"
+
     def _create_summary_sheet(self, wb):
         """Create summary sheet in Excel"""
         ws = wb.create_sheet("Summary", 0)
@@ -4459,9 +5219,10 @@ class AzureDiscovery:
                 self.scan_git_repositories()
             
             # Generate reports
-            html_file = self.generate_html_report()
+            html_file  = self.generate_html_report()
+            rg_file    = self.generate_resource_groups_report()
             excel_file = self.generate_excel_report()
-            json_file = self.save_json_output()
+            json_file  = self.save_json_output()
             
             # Summary
             self.logger.info("\n" + "="*80)
@@ -4470,16 +5231,18 @@ class AzureDiscovery:
             self.logger.info(f"📊 Total Resources Discovered: {self.discovery_data['summary'].get('total_resources', 0)}")
             self.logger.info(f"🔗 Total Dependencies Identified: {len(self.discovery_data.get('dependencies', []))}")
             self.logger.info(f"\n📁 Reports Generated:")
-            self.logger.info(f"   HTML: {html_file}")
-            self.logger.info(f"   Excel: {excel_file}")
-            self.logger.info(f"   JSON: {json_file}")
+            self.logger.info(f"   HTML (full)           : {html_file}")
+            self.logger.info(f"   Resource Group Report : {rg_file}")
+            self.logger.info(f"   Excel Workbook        : {excel_file}")
+            self.logger.info(f"   JSON Data             : {json_file}")
             self.logger.info("="*80)
             
             return {
-                'success': True,
-                'html_report': html_file,
-                'excel_report': excel_file,
-                'json_data': json_file
+                'success':        True,
+                'html_report':    html_file,
+                'rg_report':      rg_file,
+                'excel_report':   excel_file,
+                'json_data':      json_file
             }
             
         except Exception as e:
