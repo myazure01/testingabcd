@@ -3085,7 +3085,711 @@ class AzureDiscovery:
             })
         
         return dep_graph
-    
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # PHASE 6 — Full Resource Property Export & Cross-Tenant Deployment Package
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _write_json(self, path: str, data: Any) -> None:
+        """Write data as pretty-printed JSON to path, creating parent dirs as needed."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as fh:
+            json.dump(data, fh, indent=2, default=str)
+
+    def _get_api_version(self, resource_type: str) -> str:
+        """Return a stable published API version for common Azure resource types."""
+        rt = resource_type.lower()
+        table: Dict[str, str] = {
+            'microsoft.web/sites':                                  '2023-01-01',
+            'microsoft.web/serverfarms':                            '2023-01-01',
+            'microsoft.web/staticwebapps':                         '2023-01-01',
+            'microsoft.storage/storageaccounts':                    '2023-01-01',
+            'microsoft.sql/servers':                                '2023-08-01-preview',
+            'microsoft.sql/servers/databases':                      '2023-08-01-preview',
+            'microsoft.documentdb/databaseaccounts':               '2024-02-15-preview',
+            'microsoft.keyvault/vaults':                           '2023-07-01',
+            'microsoft.network/virtualnetworks':                   '2024-01-01',
+            'microsoft.network/networksecuritygroups':             '2024-01-01',
+            'microsoft.network/publicipaddresses':                 '2024-01-01',
+            'microsoft.network/loadbalancers':                     '2024-01-01',
+            'microsoft.network/applicationgateways':               '2024-01-01',
+            'microsoft.network/dnszones':                          '2023-07-01-preview',
+            'microsoft.compute/virtualmachines':                   '2024-03-01',
+            'microsoft.compute/disks':                             '2024-03-02',
+            'microsoft.compute/snapshots':                         '2024-03-02',
+            'microsoft.compute/availabilitysets':                  '2024-03-01',
+            'microsoft.containerservice/managedclusters':          '2024-02-01',
+            'microsoft.containerregistry/registries':              '2023-11-01-preview',
+            'microsoft.servicebus/namespaces':                     '2023-01-01-preview',
+            'microsoft.eventhub/namespaces':                       '2024-01-01',
+            'microsoft.cache/redis':                               '2024-03-01',
+            'microsoft.redis/redis':                               '2024-03-01',
+            'microsoft.apimanagement/service':                     '2023-09-01-preview',
+            'microsoft.insights/components':                       '2020-02-02',
+            'microsoft.operationalinsights/workspaces':            '2023-09-01',
+            'microsoft.search/searchservices':                     '2024-03-01-preview',
+            'microsoft.cognitiveservices/accounts':                '2023-10-01-preview',
+            'microsoft.databricks/workspaces':                     '2024-05-01',
+            'microsoft.datafactory/factories':                     '2018-06-01',
+            'microsoft.cdn/profiles':                              '2024-02-01',
+            'microsoft.notificationhubs/namespaces':               '2023-10-01-preview',
+            'microsoft.signalrservice/signalr':                    '2023-08-01-preview',
+            'microsoft.authorization/roleassignments':             '2022-04-01',
+        }
+        return table.get(rt, '2022-09-01')
+
+    def _build_arm_snippet(self, name: str, rtype: str, location: str, detail: Dict) -> Dict:
+        """Build a minimal deployable ARM resource object, stripping read-only fields."""
+        READ_ONLY = {
+            'provisioningstate', 'creationtime', 'lastmodifiedtime', 'status',
+            'statusdetails',    'internalid',   'serviceuri',        'managedby',
+            'tenantid',         'principalid',  'resourceguid',      'etag',
+            'privateendpointconnections',
+        }
+
+        def _strip(obj: Any) -> Any:
+            if isinstance(obj, dict):
+                return {k: _strip(v) for k, v in obj.items()
+                        if k.lower() not in READ_ONLY}
+            if isinstance(obj, list):
+                return [_strip(i) for i in obj]
+            return obj
+
+        props: Dict[str, Any] = _strip(detail.get('properties', {}))
+        snippet: Dict[str, Any] = {
+            'type':       rtype,
+            'apiVersion': self._get_api_version(rtype),
+            'name':       name,
+            'location':   location,
+            'properties': props,
+        }
+        for key in ('sku', 'kind', 'tags', 'identity', 'zones'):
+            if detail.get(key):
+                snippet[key] = detail[key]
+        return snippet
+
+    def _generate_redeploy_notes(self, resource_type: str, detail: Dict) -> List[str]:
+        """Return actionable redeployment guidance for a specific Azure resource type."""
+        rt = resource_type.lower()
+        notes: List[str] = []
+        if 'microsoft.keyvault/vaults' in rt:
+            notes += [
+                'Secrets, keys, and certificates are NOT exported — export manually via: '
+                'az keyvault secret list / download',
+                'Soft-delete and purge-protection settings must be matched in the target tenant.',
+                'Access policies and RBAC role assignments reference source-tenant object IDs '
+                '— re-grant to new principal IDs after deployment.',
+            ]
+        elif 'microsoft.storage/storageaccounts' in rt:
+            notes += [
+                'Blob / Table / Queue data must be migrated separately using AzCopy or '
+                'Azure Data Factory.',
+                'SAS tokens and shared-access policies must be regenerated in the target tenant.',
+                'Firewall rules (VNet service endpoints, allowed IPs) need updating for the '
+                'new environment.',
+            ]
+        elif 'microsoft.sql/servers/databases' in rt or 'microsoft.sql/servers' in rt:
+            notes += [
+                'Export database data as BACPAC: az sql db export --server ... --name ... '
+                '--storage-key ... --storage-uri ...',
+                'Admin password is NOT included — supply a new password during deployment.',
+                'Firewall rules reference IPs / VNets that may differ in the target tenant.',
+                'Elastic Pool membership must be recreated manually if applicable.',
+            ]
+        elif 'microsoft.documentdb/databaseaccounts' in rt:
+            notes += [
+                'Account keys are NOT included — regenerate after deployment.',
+                'Migrate data using the Azure Cosmos DB Migration Tool or Azure Data Factory.',
+                'Replicated regions must be re-added; geo-redundancy config must match '
+                'throughput tier.',
+            ]
+        elif 'microsoft.compute/virtualmachines' in rt:
+            notes += [
+                'OS disk image / VHD is NOT exported — use Azure Migrate or snapshot + '
+                'copy the VHD manually.',
+                'Admin password / SSH key is NOT included — provide new credentials at '
+                'deploy time.',
+                'Availability Set, NIC, and Disk resources must be deployed separately first.',
+            ]
+        elif 'microsoft.servicebus/namespaces' in rt or 'microsoft.eventhub/namespaces' in rt:
+            notes += [
+                'Connection strings (Shared Access Keys) must be regenerated after deployment.',
+                'Queue / Topic / Hub definitions are included; in-flight messages are NOT '
+                'migrated.',
+                'Consumer groups and subscriptions must be validated post-deployment.',
+            ]
+        elif 'microsoft.web/sites' in rt:
+            notes += [
+                'Application Settings containing secrets are NOT exported — review and re-add '
+                'manually in the target tenant.',
+                'Application code must be redeployed via CI/CD pipeline or zip-deploy.',
+                'Custom domains require DNS re-pointing and SSL certificate re-binding.',
+                'Managed Identity must be re-granted RBAC roles in the target tenant.',
+            ]
+        elif 'microsoft.apimanagement/service' in rt:
+            notes += [
+                'Subscription keys and named values with secrets must be reconfigured manually.',
+                'Backend URLs may point to source-tenant resources — update after migration.',
+                'Custom domains require new SSL certificates in the target tenant.',
+            ]
+        elif 'microsoft.containerservice/managedclusters' in rt:
+            notes += [
+                'AKS cluster is reprovisioned fresh — existing node state is NOT migrated.',
+                'Workloads must be redeployed via Helm charts or kubectl apply.',
+                'Persistent Volume Claims backed by Azure Disks must be recreated and data '
+                'migrated separately.',
+                'AAD integration and RBAC bindings reference source-tenant object IDs — '
+                'update all bindings after deployment.',
+            ]
+        else:
+            notes.append(
+                'Review all endpoint references, connection strings, and managed identities '
+                'for tenant-specific values.'
+            )
+        return notes
+
+    def _flag_sensitive_params(self, resource_type: str, detail: Dict) -> List[str]:
+        """Walk the resource properties tree and return paths to potentially sensitive keys."""
+        SENSITIVE_KEYS = {
+            'administratorloginpassword', 'password',          'secretvalue',
+            'connectionstring',           'primarykey',         'secondarykey',
+            'primaryconnectionstring',    'secondaryconnectionstring',
+            'instrumentationkey',         'connectionstrings',  'apikey',
+            'sastoken',   'sharedaccesskey', 'clientsecret',
+            'adminpassword', 'sshpublickey',
+        }
+        found: List[str] = []
+
+        def _walk(obj: Any, path: str = '') -> None:
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    _walk(v, f'{path}.{k}' if path else k)
+            elif isinstance(obj, list):
+                for idx, item in enumerate(obj):
+                    _walk(item, f'{path}[{idx}]')
+            else:
+                leaf_key = path.split('.')[-1].split('[')[0].lower()
+                leaf_key = leaf_key.replace('_', '').replace('-', '')
+                if leaf_key in SENSITIVE_KEYS:
+                    found.append(path)
+
+        _walk(detail.get('properties', {}))
+        return list(dict.fromkeys(found))  # deduplicate, preserve order
+
+    def _get_resource_full_detail(self, resource_id: str,
+                                   sub_id: str, resource_type: str) -> Dict:
+        """Run `az resource show` and return the parsed JSON, or {} on failure."""
+        import subprocess as _sp
+        api_ver = self._get_api_version(resource_type)
+        cmd = [
+            'az', 'resource', 'show',
+            '--ids',         resource_id,
+            '--api-version', api_ver,
+            '--subscription', sub_id,
+            '--output',      'json',
+        ]
+        try:
+            r = _sp.run(cmd, capture_output=True, text=True, timeout=60, shell=True)
+            if r.returncode == 0 and r.stdout.strip():
+                return json.loads(r.stdout)
+            self.logger.debug(f"      az resource show non-zero exit for {resource_id}: "
+                              f"{r.stderr[:200]}")
+        except Exception as ex:
+            self.logger.debug(f"      az resource show failed for {resource_id}: {ex}")
+        return {}
+
+    def export_resource_properties(self) -> Dict[str, Any]:
+        """Fetch full ARM properties for every discovered resource via az resource show.
+
+        Returns a nested dict::
+
+            {
+              sub_id: {
+                'name': str,
+                'resource_groups': {
+                  rg_name: {
+                    'location': str,
+                    'tags':     dict,
+                    'resources': [
+                      {
+                        id, name, type, location, sku, kind, zones, tags,
+                        api_version, properties, arm_snippet,
+                        redeploy_notes, sensitive_keys
+                      }, ...
+                    ]
+                  }
+                }
+              }
+            }
+        """
+        self.logger.info("\n" + "=" * 80)
+        self.logger.info("Exporting Full Resource Properties (cross-tenant deployment)")
+        self.logger.info("=" * 80)
+
+        result: Dict[str, Any] = {}
+        total_resources = 0
+
+        for sub in self.discovery_data.get('subscriptions', []):
+            sub_id   = sub['id']
+            sub_name = sub['name']
+            result[sub_id] = {'name': sub_name, 'resource_groups': {}}
+
+            rg_map: Dict[str, Any] = sub.get('resource_groups', {})
+            for rg_name, rg_data in rg_map.items():
+                resources_out: List[Dict] = []
+                for res in rg_data.get('resources', []):
+                    res_id   = res.get('id',       '')
+                    res_name = res.get('name',     '')
+                    res_type = res.get('type',     '')
+                    res_loc  = res.get('location', '')
+
+                    self.logger.debug(f"   Fetching detail: {res_name} ({res_type})")
+                    detail = self._get_resource_full_detail(res_id, sub_id, res_type)
+
+                    arm_snippet    = self._build_arm_snippet(res_name, res_type,
+                                                             res_loc, detail)
+                    redeploy_notes = self._generate_redeploy_notes(res_type, detail)
+                    sensitive_keys = self._flag_sensitive_params(res_type, detail)
+
+                    resources_out.append({
+                        'id':             res_id,
+                        'name':           res_name,
+                        'type':           res_type,
+                        'location':       res_loc,
+                        'sku':            detail.get('sku'),
+                        'kind':           detail.get('kind'),
+                        'zones':          detail.get('zones'),
+                        'tags':           detail.get('tags', {}),
+                        'api_version':    self._get_api_version(res_type),
+                        'properties':     detail.get('properties', {}),
+                        'arm_snippet':    arm_snippet,
+                        'redeploy_notes': redeploy_notes,
+                        'sensitive_keys': sensitive_keys,
+                    })
+                    total_resources += 1
+
+                result[sub_id]['resource_groups'][rg_name] = {
+                    'location':  rg_data.get('location', ''),
+                    'tags':      rg_data.get('tags', {}),
+                    'resources': resources_out,
+                }
+
+        self.logger.info(f"Collected full properties for {total_resources} resource(s)")
+        self._full_inventory = result   # cache for Excel sheet
+        return result
+
+    def generate_deployment_package(self, full_inventory: Dict[str, Any]) -> str:
+        """Write one deployment package folder per resource group.
+
+        Output layout under ``output_dir``::
+
+            deployment_package_<ts>/
+              <safe_sub_name>/
+                <rg_name>/
+                  arm_template.json
+                  parameters.json
+                  deploy.ps1
+                  deploy.sh
+                  resource_inventory.json
+
+        Returns the path to the top-level ``deployment_package_<ts>/`` folder.
+        """
+        self.logger.info("\n" + "=" * 80)
+        self.logger.info("Building Deployment Packages")
+        self.logger.info("=" * 80)
+
+        ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base = os.path.join(self.config['output_dir'], f'deployment_package_{ts}')
+        os.makedirs(base, exist_ok=True)
+
+        SENSITIVE_LEAF = {
+            'administratorloginpassword', 'password',          'secretvalue',
+            'connectionstring',           'primarykey',         'secondarykey',
+            'primaryconnectionstring',    'secondaryconnectionstring',
+            'instrumentationkey',         'apikey',             'sastoken',
+            'sharedaccesskey',            'clientsecret',       'adminpassword',
+        }
+
+        def _redact(obj: Any) -> Any:
+            """Return a copy with sensitive leaf values replaced by placeholder strings."""
+            if isinstance(obj, dict):
+                out: Dict[str, Any] = {}
+                for k, v in obj.items():
+                    norm = k.lower().replace('_', '').replace('-', '')
+                    if norm in SENSITIVE_LEAF and isinstance(v, str) and v:
+                        out[k] = f'<REPLACE_WITH_{k.upper()}>'
+                    else:
+                        out[k] = _redact(v)
+                return out
+            if isinstance(obj, list):
+                return [_redact(i) for i in obj]
+            return obj
+
+        pkg_count = 0
+        for sub_id, sub_data in full_inventory.items():
+            safe_sub = re.sub(r'[^A-Za-z0-9_\-]', '_', sub_data.get('name', sub_id))[:60]
+            for rg_name, rg_data in sub_data.get('resource_groups', {}).items():
+                rg_dir = os.path.join(base, safe_sub, rg_name)
+                os.makedirs(rg_dir, exist_ok=True)
+
+                resources = rg_data.get('resources', [])
+                if not resources:
+                    continue
+
+                # ── arm_template.json ─────────────────────────────────────────
+                arm_resources: List[Dict] = []
+                params_schema: Dict[str, Any] = {}
+                params_values: Dict[str, Any] = {}
+
+                for res in resources:
+                    snippet = dict(res.get('arm_snippet', {}))
+                    snippet['properties'] = _redact(snippet.get('properties', {}))
+                    arm_resources.append(snippet)
+
+                    for sk in res.get('sensitive_keys', []):
+                        param_name = re.sub(r'[^A-Za-z0-9]', '_', sk)[-64:]
+                        if param_name not in params_schema:
+                            params_schema[param_name] = {
+                                'type':     'securestring',
+                                'metadata': {'description': f'Sensitive value for: {sk}'},
+                            }
+                            params_values[param_name] = {
+                                'value': f'<REPLACE_WITH_{param_name.upper()}>'
+                            }
+
+                arm_template: Dict[str, Any] = {
+                    '$schema': ('https://schema.management.azure.com/schemas/'
+                                '2019-04-01/deploymentTemplate.json#'),
+                    'contentVersion': '1.0.0.0',
+                    'parameters': params_schema,
+                    'variables':  {},
+                    'resources':  arm_resources,
+                    'outputs':    {},
+                }
+                self._write_json(os.path.join(rg_dir, 'arm_template.json'), arm_template)
+
+                # ── parameters.json ───────────────────────────────────────────
+                params_file: Dict[str, Any] = {
+                    '$schema': ('https://schema.management.azure.com/schemas/'
+                                '2019-04-01/deploymentParameters.json#'),
+                    'contentVersion': '1.0.0.0',
+                    'parameters': params_values,
+                }
+                self._write_json(os.path.join(rg_dir, 'parameters.json'), params_file)
+
+                # ── resource_inventory.json ───────────────────────────────────
+                self._write_json(os.path.join(rg_dir, 'resource_inventory.json'), rg_data)
+
+                # ── deploy.ps1 ────────────────────────────────────────────────
+                rg_loc  = rg_data.get('location', 'eastus')
+                ps1_lines = [
+                    f"# Deploy {rg_name} — generated by Azure Discovery Tool",
+                    f"# Edit parameters.json with real secret values before running.",
+                    "",
+                    "param(",
+                    f"    [string]$SubscriptionId   = '{sub_id}',",
+                    f"    [string]$ResourceGroupName = '{rg_name}',",
+                    f"    [string]$Location          = '{rg_loc}'",
+                    ")",
+                    "",
+                    "Connect-AzAccount -Subscription $SubscriptionId",
+                    "New-AzResourceGroup -Name $ResourceGroupName -Location $Location -Force",
+                    "New-AzResourceGroupDeployment `",
+                    "    -ResourceGroupName      $ResourceGroupName `",
+                    "    -TemplateFile           .\\arm_template.json `",
+                    "    -TemplateParameterFile  .\\parameters.json `",
+                    "    -Verbose",
+                ]
+                with open(os.path.join(rg_dir, 'deploy.ps1'), 'w', encoding='utf-8') as fh:
+                    fh.write('\n'.join(ps1_lines) + '\n')
+
+                # ── deploy.sh ─────────────────────────────────────────────────
+                sh_lines = [
+                    "#!/bin/bash",
+                    f"# Deploy {rg_name} — generated by Azure Discovery Tool",
+                    f"# Edit parameters.json with real secret values before running.",
+                    "",
+                    f"SUBSCRIPTION_ID='{sub_id}'",
+                    f"RESOURCE_GROUP='{rg_name}'",
+                    f"LOCATION='{rg_loc}'",
+                    "",
+                    "az login",
+                    'az account set --subscription "$SUBSCRIPTION_ID"',
+                    'az group create --name "$RESOURCE_GROUP" --location "$LOCATION"',
+                    "az deployment group create \\",
+                    '  --resource-group "$RESOURCE_GROUP" \\',
+                    "  --template-file  arm_template.json \\",
+                    "  --parameters     @parameters.json",
+                ]
+                with open(os.path.join(rg_dir, 'deploy.sh'), 'w', encoding='utf-8') as fh:
+                    fh.write('\n'.join(sh_lines) + '\n')
+
+                pkg_count += 1
+
+        self.logger.info(f"Deployment packages written for {pkg_count} resource group(s): {base}")
+        return base
+
+    def generate_full_inventory_html(self, full_inventory: Dict[str, Any]) -> str:
+        """Generate a standalone HTML file with full resource properties.
+
+        Features:
+        - Search + subscription / type filter
+        - Per-resource modal with 4 tabs:
+          ARM Template | Full Properties | Redeploy Notes | Sensitive Params
+        - Amber highlight for resources with sensitive parameters
+        - CSV export button
+        """
+        self.logger.info("\n" + "=" * 80)
+        self.logger.info("Generating Full Resource Inventory HTML")
+        self.logger.info("=" * 80)
+
+        out_file = os.path.join(
+            self.config['output_dir'],
+            f"resource_inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        )
+
+        rows_html   = ''
+        modals_html = ''
+        total_res   = 0
+        total_sens  = 0
+        sub_opts: Set[str]  = set()
+        type_opts: Set[str] = set()
+
+        for sub_id, sub_data in full_inventory.items():
+            sub_name = sub_data.get('name', sub_id)
+            sub_opts.add(sub_name)
+            for rg_name, rg_data in sub_data.get('resource_groups', {}).items():
+                for res in rg_data.get('resources', []):
+                    total_res += 1
+                    rid    = f"res_{total_res}"
+                    rname  = res.get('name',     '')
+                    rtype  = res.get('type',     '')
+                    rloc   = res.get('location', '')
+                    sku    = (res.get('sku') or {}).get('name', '')
+                    notes  = res.get('redeploy_notes', [])
+                    sens   = res.get('sensitive_keys',  [])
+                    apiver = res.get('api_version',     '')
+                    type_opts.add(rtype)
+
+                    has_sens   = bool(sens)
+                    if has_sens:
+                        total_sens += 1
+
+                    row_cls    = 'sens-row' if has_sens else ''
+                    sens_badge = ('<span class="badge badge-warn">SENSITIVE</span>'
+                                  if has_sens else '')
+
+                    arm_json  = json.dumps(res.get('arm_snippet', {}),
+                                           indent=2, default=str)
+                    full_json = json.dumps(res.get('properties', {}),
+                                           indent=2, default=str)
+
+                    # Escape < > in JSON so it renders safely in <pre>
+                    arm_json  = arm_json.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                    full_json = full_json.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+                    notes_li  = ''.join(f'<li>{n}</li>' for n in notes) \
+                                if notes else '<li>No specific notes.</li>'
+                    sens_li   = ''.join(f'<li><code>{s}</code></li>' for s in sens) \
+                                if sens else '<li>None detected.</li>'
+                    warn_div  = (
+                        '<div class="warn-box">This resource has sensitive parameters '
+                        'that were NOT exported. Supply these values manually in '
+                        'parameters.json before deploying.</div>'
+                    ) if has_sens else ''
+
+                    rows_html += (
+                        f'<tr class="{row_cls}" data-sub="{sub_name}" '
+                        f'data-type="{rtype}" onclick="openModal(\'{rid}\')" '
+                        f'style="cursor:pointer">'
+                        f'<td>{sub_name}</td><td>{rg_name}</td><td>{rname}</td>'
+                        f'<td>{rtype}</td><td>{rloc}</td><td>{sku}</td>'
+                        f'<td>{apiver}</td>'
+                        f'<td>{sens_badge}</td>'
+                        f'</tr>\n'
+                    )
+
+                    modals_html += f"""<div id="{rid}" class="modal" onclick="if(event.target===this)closeModal('{rid}')">
+  <div class="modal-box">
+    <button class="modal-close" onclick="closeModal('{rid}')">&times;</button>
+    <h2>{rname}</h2>
+    <p style="color:#666;margin:0 0 12px">{rtype} &bull; {rloc} &bull; {sub_name} / {rg_name}</p>
+    <div class="tabs">
+      <button class="tab active" onclick="switchTab(this,'{rid}_arm')">ARM Template</button>
+      <button class="tab" onclick="switchTab(this,'{rid}_props')">Full Properties</button>
+      <button class="tab" onclick="switchTab(this,'{rid}_notes')">Redeploy Notes</button>
+      <button class="tab" onclick="switchTab(this,'{rid}_sens')">Sensitive Params</button>
+    </div>
+    <div id="{rid}_arm" class="tab-panel active">
+      <button class="copy-btn" onclick="copyText('{rid}_arm_code')">Copy</button>
+      <pre id="{rid}_arm_code">{arm_json}</pre>
+    </div>
+    <div id="{rid}_props" class="tab-panel">
+      <button class="copy-btn" onclick="copyText('{rid}_props_code')">Copy</button>
+      <pre id="{rid}_props_code">{full_json}</pre>
+    </div>
+    <div id="{rid}_notes" class="tab-panel">
+      <ul class="notes-list">{notes_li}</ul>
+    </div>
+    <div id="{rid}_sens" class="tab-panel">
+      {warn_div}
+      <ul class="notes-list">{sens_li}</ul>
+    </div>
+  </div>
+</div>
+"""
+
+        ts_str       = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        sub_opts_html = (
+            '<option value="">All Subscriptions</option>'
+            + ''.join(f'<option>{s}</option>' for s in sorted(sub_opts))
+        )
+        type_opts_html = (
+            '<option value="">All Types</option>'
+            + ''.join(f'<option>{t}</option>' for t in sorted(type_opts))
+        )
+        total_subs = len(full_inventory)
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Azure Full Resource Inventory</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:Segoe UI,Arial,sans-serif;background:#f0f4f8;color:#222}}
+.header{{background:linear-gradient(135deg,#0078d4,#106ebe);color:#fff;padding:28px 36px}}
+.header h1{{font-size:1.8rem;font-weight:700}}
+.header p{{opacity:.85;margin-top:4px}}
+.stat-bar{{display:flex;gap:16px;padding:20px 36px;background:#fff;border-bottom:1px solid #dde3ea;flex-wrap:wrap}}
+.stat{{padding:12px 24px;border-radius:8px;background:#f7f9fc;border:1px solid #dde3ea;text-align:center}}
+.stat .num{{font-size:2rem;font-weight:700;color:#0078d4}}
+.stat .lbl{{font-size:.75rem;text-transform:uppercase;color:#666;letter-spacing:.04em}}
+.stat.warn .num{{color:#d83b01}}
+.controls{{padding:16px 36px;background:#fff;border-bottom:1px solid #dde3ea;display:flex;gap:12px;flex-wrap:wrap;align-items:center}}
+.controls input,.controls select{{padding:8px 12px;border:1px solid #ccc;border-radius:6px;font-size:.9rem}}
+.controls input{{width:280px}}
+.btn-csv{{padding:8px 18px;background:#0078d4;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:.9rem}}
+.btn-csv:hover{{background:#006cbe}}
+.table-wrap{{padding:24px 36px}}
+table{{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 2px 8px #0001}}
+th{{background:#0078d4;color:#fff;padding:10px 14px;text-align:left;font-size:.82rem;text-transform:uppercase;letter-spacing:.04em}}
+td{{padding:10px 14px;font-size:.88rem;border-bottom:1px solid #eef1f5}}
+tr:hover td{{background:#e9f2fb}}
+tr.sens-row td{{background:#fff4ce}}
+tr.sens-row:hover td{{background:#ffe9a0}}
+.badge{{padding:2px 8px;border-radius:12px;font-size:.72rem;font-weight:700;text-transform:uppercase}}
+.badge-warn{{background:#d83b01;color:#fff}}
+.modal{{display:none;position:fixed;inset:0;background:#0006;z-index:1000;overflow:auto;padding:40px 20px}}
+.modal.open{{display:flex;align-items:flex-start;justify-content:center}}
+.modal-box{{background:#fff;border-radius:12px;padding:28px;width:100%;max-width:920px;position:relative;max-height:90vh;overflow:auto}}
+.modal-close{{position:absolute;top:14px;right:18px;background:none;border:none;font-size:1.6rem;cursor:pointer;color:#666}}
+.tabs{{display:flex;gap:6px;margin:16px 0 0}}
+.tab{{padding:8px 18px;border:1px solid #dde3ea;border-radius:6px 6px 0 0;background:#f7f9fc;cursor:pointer;font-size:.85rem}}
+.tab.active{{background:#0078d4;color:#fff;border-color:#0078d4}}
+.tab-panel{{display:none;border:1px solid #dde3ea;border-radius:0 6px 6px 6px;padding:16px;position:relative}}
+.tab-panel.active{{display:block}}
+pre{{background:#1e1e1e;color:#d4d4d4;padding:16px;border-radius:6px;overflow:auto;font-size:.8rem;max-height:420px;white-space:pre-wrap;word-wrap:break-word}}
+.copy-btn{{position:absolute;top:24px;right:24px;padding:4px 12px;background:#0078d4;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:.78rem}}
+.copy-btn:hover{{background:#006cbe}}
+.notes-list{{padding-left:20px;line-height:1.7;margin-top:8px}}
+.notes-list li{{margin-bottom:6px;font-size:.9rem}}
+.notes-list code{{background:#f0f0f0;padding:1px 5px;border-radius:3px;font-size:.82rem}}
+.warn-box{{background:#fff4ce;border:1px solid #f0e68c;border-radius:6px;padding:10px 14px;margin-bottom:12px;font-size:.88rem;color:#7a5a00}}
+.hidden{{display:none!important}}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Azure Full Resource Inventory</h1>
+  <p>Cross-tenant redeployment guide &mdash; Generated {ts_str}</p>
+</div>
+<div class="stat-bar">
+  <div class="stat"><div class="num">{total_res}</div><div class="lbl">Total Resources</div></div>
+  <div class="stat warn"><div class="num">{total_sens}</div><div class="lbl">With Sensitive Params</div></div>
+  <div class="stat"><div class="num">{total_subs}</div><div class="lbl">Subscriptions</div></div>
+</div>
+<div class="controls">
+  <input type="text" id="searchBox" placeholder="Search name, type, resource group..."
+         oninput="filterTable()">
+  <select id="subFilter" onchange="filterTable()">{sub_opts_html}</select>
+  <select id="typeFilter" onchange="filterTable()">{type_opts_html}</select>
+  <button class="btn-csv" onclick="exportCSV()">Export CSV</button>
+</div>
+<div class="table-wrap">
+  <table id="invTable">
+    <thead><tr>
+      <th>Subscription</th><th>Resource Group</th><th>Name</th>
+      <th>Type</th><th>Location</th><th>SKU</th><th>API Version</th><th>Flags</th>
+    </tr></thead>
+    <tbody id="tableBody">
+{rows_html}
+    </tbody>
+  </table>
+</div>
+{modals_html}
+<script>
+function openModal(id){{document.getElementById(id).classList.add('open');}}
+function closeModal(id){{document.getElementById(id).classList.remove('open');}}
+function switchTab(btn, panelId){{
+  var box = btn.closest('.modal-box');
+  box.querySelectorAll('.tab').forEach(function(t){{t.classList.remove('active');}});
+  box.querySelectorAll('.tab-panel').forEach(function(p){{p.classList.remove('active');}});
+  btn.classList.add('active');
+  document.getElementById(panelId).classList.add('active');
+}}
+function copyText(id){{
+  var el = document.getElementById(id);
+  if (navigator.clipboard){{
+    navigator.clipboard.writeText(el.textContent);
+  }} else {{
+    var r = document.createRange();
+    r.selectNode(el);
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(r);
+    document.execCommand('copy');
+  }}
+}}
+function filterTable(){{
+  var q   = document.getElementById('searchBox').value.toLowerCase();
+  var sub = document.getElementById('subFilter').value;
+  var typ = document.getElementById('typeFilter').value;
+  document.querySelectorAll('#tableBody tr').forEach(function(row){{
+    var txt  = row.textContent.toLowerCase();
+    var rSub = row.getAttribute('data-sub')  || '';
+    var rTyp = row.getAttribute('data-type') || '';
+    var ok = (q === '' || txt.includes(q))
+          && (sub === '' || rSub === sub)
+          && (typ === '' || rTyp === typ);
+    row.classList.toggle('hidden', !ok);
+  }});
+}}
+function exportCSV(){{
+  var rows = [['Subscription','ResourceGroup','Name','Type','Location',
+               'SKU','APIVersion','HasSensitive']];
+  document.querySelectorAll('#tableBody tr').forEach(function(row){{
+    if (!row.classList.contains('hidden')){{
+      rows.push(Array.from(row.querySelectorAll('td')).map(function(td){{
+        return '"' + td.textContent.replace(/"/g, '""') + '"';
+      }}));
+    }}
+  }});
+  var csv = rows.map(function(r){{return r.join(',');}}).join('\\n');
+  var a   = document.createElement('a');
+  a.href  = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+  a.download = 'resource_inventory.csv';
+  a.click();
+}}
+</script>
+</body>
+</html>"""
+
+        with open(out_file, 'w', encoding='utf-8') as fh:
+            fh.write(html)
+        self.logger.info(f"Full inventory HTML generated: {out_file}")
+        return out_file
+
     def generate_html_report(self):
         """Generate comprehensive HTML report"""
         self.logger.info("\n" + "="*80)
@@ -4704,6 +5408,7 @@ class AzureDiscovery:
         self._create_summary_sheet(wb)
         self._create_resource_groups_sheet(wb)
         self._create_empty_rgs_sheet(wb)
+        self._create_resource_properties_sheet(wb)
         self._create_application_dependencies_sheet(wb)
         self._create_arm_templates_sheet(wb)
         self._create_code_inventory_sheet(wb)
@@ -4880,6 +5585,108 @@ class AzureDiscovery:
 
         if row > 2:
             ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{row - 1}"
+
+    def _create_resource_properties_sheet(self, wb: Any) -> None:
+        """Create an Excel sheet with full ARM properties for every discovered resource.
+
+        Columns:
+          Subscription | Resource Group | Name | Type | Location |
+          SKU Name | SKU Tier | Kind | Zones | Tags | API Version |
+          Sensitive Params | Redeploy Notes | ARM Template JSON (capped 3 000 chars)
+
+        Rows with sensitive parameters are highlighted in amber.
+        """
+        full_inventory: Dict[str, Any] = getattr(self, '_full_inventory', {})
+        if not full_inventory:
+            return  # export_resource_properties() was not called — skip silently
+
+        ws = wb.create_sheet("Resource Properties")
+
+        HDR_FILL  = PatternFill(start_color="0078D4", end_color="0078D4", fill_type="solid")
+        HDR_FONT  = Font(bold=True, color="FFFFFF", size=11)
+        SENS_FILL = PatternFill(start_color="FFF4CE", end_color="FFF4CE", fill_type="solid")
+        SENS_FONT = Font(color="7A4F01", italic=True)
+        WRAP      = Alignment(wrap_text=True, vertical="top")
+        THIN      = Border(
+            bottom=Side(style='thin', color='DDEBF7'),
+            right=Side(style='thin',  color='DDEBF7'),
+        )
+
+        headers = [
+            "Subscription", "Resource Group", "Name", "Type", "Location",
+            "SKU Name", "SKU Tier", "Kind", "Zones", "Tags",
+            "API Version", "Sensitive Params", "Redeploy Notes",
+            "ARM Template JSON",
+        ]
+        col_widths = [26, 28, 30, 46, 18, 16, 16, 16, 14, 40, 20, 40, 50, 60]
+
+        for col_idx, hdr in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_idx, value=hdr)
+            cell.font      = HDR_FONT
+            cell.fill      = HDR_FILL
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        ws.freeze_panes = 'A2'
+        ws.row_dimensions[1].height = 20
+
+        data_row = 2
+        for sub_id, sub_data in full_inventory.items():
+            sub_name = sub_data.get('name', sub_id)
+            for rg_name, rg_data in sub_data.get('resource_groups', {}).items():
+                for res in rg_data.get('resources', []):
+                    rname   = res.get('name',     '')
+                    rtype   = res.get('type',     '')
+                    rloc    = res.get('location', '')
+                    apiver  = res.get('api_version', '')
+                    sku     = res.get('sku') or {}
+                    sku_name = sku.get('name', '') if isinstance(sku, dict) else ''
+                    sku_tier = sku.get('tier', '') if isinstance(sku, dict) else ''
+                    kind    = res.get('kind', '') or ''
+                    zones   = ', '.join(res.get('zones') or [])
+                    tags    = '; '.join(
+                        f'{k}={v}' for k, v in (res.get('tags') or {}).items()
+                    )
+                    sens    = res.get('sensitive_keys', [])
+                    notes   = res.get('redeploy_notes',  [])
+                    arm_raw = json.dumps(res.get('arm_snippet', {}),
+                                         indent=2, default=str)
+                    # Cap ARM JSON at 3 000 chars to stay within Excel cell limit
+                    arm_str = arm_raw[:3000] + (' ... [truncated]' if len(arm_raw) > 3000 else '')
+
+                    has_sens = bool(sens)
+                    row_vals = [
+                        sub_name,
+                        rg_name,
+                        rname,
+                        rtype,
+                        rloc,
+                        sku_name,
+                        sku_tier,
+                        kind,
+                        zones,
+                        tags or '—',
+                        apiver,
+                        '\n'.join(sens)  if sens  else '—',
+                        '\n'.join(notes) if notes else '—',
+                        arm_str,
+                    ]
+                    for col_idx, val in enumerate(row_vals, 1):
+                        cell = ws.cell(row=data_row, column=col_idx, value=val)
+                        cell.alignment = WRAP
+                        cell.border    = THIN
+                        if has_sens:
+                            cell.fill = SENS_FILL
+                            cell.font = SENS_FONT
+
+                    data_row += 1
+
+        if data_row > 2:
+            ws.auto_filter.ref = (
+                f"A1:{get_column_letter(len(headers))}{data_row - 1}"
+            )
+
+        for col_idx, width in enumerate(col_widths, 1):
+            ws.column_dimensions[get_column_letter(col_idx)].width = width
 
     def _create_summary_sheet(self, wb):
         """Create summary sheet in Excel"""
@@ -5406,31 +6213,40 @@ class AzureDiscovery:
             if self.config.get('scan_code', True):
                 self.scan_git_repositories()
             
+            # Phase 6 — full resource property export & deployment packages
+            full_inventory   = self.export_resource_properties()
+            inventory_html   = self.generate_full_inventory_html(full_inventory)
+            deployment_pkg   = self.generate_deployment_package(full_inventory)
+
             # Generate reports
             html_file  = self.generate_html_report()
             rg_file    = self.generate_resource_groups_report()
             excel_file = self.generate_excel_report()
             json_file  = self.save_json_output()
-            
+
             # Summary
             self.logger.info("\n" + "="*80)
             self.logger.info("DISCOVERY COMPLETED SUCCESSFULLY!")
             self.logger.info("="*80)
-            self.logger.info(f"📊 Total Resources Discovered: {self.discovery_data['summary'].get('total_resources', 0)}")
-            self.logger.info(f"🔗 Total Dependencies Identified: {len(self.discovery_data.get('dependencies', []))}")
-            self.logger.info(f"\n📁 Reports Generated:")
-            self.logger.info(f"   HTML (full)           : {html_file}")
-            self.logger.info(f"   Resource Group Report : {rg_file}")
-            self.logger.info(f"   Excel Workbook        : {excel_file}")
-            self.logger.info(f"   JSON Data             : {json_file}")
+            self.logger.info(f"\U0001f4ca Total Resources Discovered: {self.discovery_data['summary'].get('total_resources', 0)}")
+            self.logger.info(f"\U0001f517 Total Dependencies Identified: {len(self.discovery_data.get('dependencies', []))}")
+            self.logger.info(f"\n\U0001f4c1 Reports Generated:")
+            self.logger.info(f"   HTML (full)              : {html_file}")
+            self.logger.info(f"   Resource Group Report    : {rg_file}")
+            self.logger.info(f"   Full Inventory HTML      : {inventory_html}")
+            self.logger.info(f"   Deployment Packages      : {deployment_pkg}")
+            self.logger.info(f"   Excel Workbook           : {excel_file}")
+            self.logger.info(f"   JSON Data                : {json_file}")
             self.logger.info("="*80)
-            
+
             return {
-                'success':        True,
-                'html_report':    html_file,
-                'rg_report':      rg_file,
-                'excel_report':   excel_file,
-                'json_data':      json_file
+                'success':          True,
+                'html_report':      html_file,
+                'rg_report':        rg_file,
+                'inventory_html':   inventory_html,
+                'deployment_pkg':   deployment_pkg,
+                'excel_report':     excel_file,
+                'json_data':        json_file,
             }
             
         except Exception as e:
