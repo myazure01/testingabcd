@@ -3,8 +3,49 @@ import threading, shutil, csv
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ── az CLI command (overridden from config az_path) ───────────────────────────
-_AZ_CMD = ["az"]
+# Force UTF-8 output on Windows to avoid cp1252 UnicodeEncodeError caused by
+# box-drawing and arrow characters used in console output.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+# ── az CLI detection ──────────────────────────────────────────────────────────
+# On Windows, az ships as az.cmd and must run through cmd.exe (shell=True).
+# shutil.which respects PATHEXT so it resolves az → az.cmd automatically.
+def _detect_az():
+    import shutil
+    found = shutil.which("az")                   # returns full path e.g. C:\...\az.cmd
+    if found:
+        is_cmd = found.lower().endswith((".cmd", ".bat"))
+        return found, is_cmd
+    # hard-coded fallback for default Azure CLI install paths on Windows
+    for p in (
+        r"C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin\az.cmd",
+        r"C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd",
+    ):
+        if os.path.isfile(p):
+            return p, True
+    return "az", False
+
+_AZ_EXE, _AZ_SHELL = _detect_az()
+_AZ_CMD = [_AZ_EXE]
+
+
+def _az_subprocess_args(args_list):
+    """Return (cmd, shell) ready for subprocess.run.
+    On Windows with a .cmd file, shell=True is required and the command must
+    be a properly quoted string (shell=True + list silently drops all args
+    after the first on Windows).
+    """
+    full = _AZ_CMD + list(args_list) + ["--output", "json"]
+    if _AZ_SHELL:
+        # Quote the exe path in case it contains spaces, join the rest normally
+        quoted_exe = f'"{_AZ_EXE}"'
+        return quoted_exe + " " + " ".join(full[1:]), True
+    return full, False
 
 # ── dependency check ──────────────────────────────────────────────────────────
 def _check_deps():
@@ -55,14 +96,10 @@ def run_az(args_list, verbose=False):
             f"READ-ONLY VIOLATION: az command contains write verb(s) {forbidden}. "
             f"Full args: {args_list}")
     try:
-        full_cmd = _AZ_CMD + args_list + ["--output", "json"]
-        # When shell=True on Windows the command must be a string, not a list.
-        # Passing a list with shell=True silently drops all arguments after [0].
-        cmd_arg = " ".join(full_cmd) if _AZ_SHELL else full_cmd
+        cmd, use_shell = _az_subprocess_args(args_list)
         result = subprocess.run(
-            cmd_arg,
-            capture_output=True, text=True, timeout=120,
-            shell=_AZ_SHELL
+            cmd, capture_output=True, text=True,
+            timeout=120, shell=use_shell
         )
         if result.returncode != 0:
             if verbose:
@@ -3047,9 +3084,9 @@ def main():
 
     # ── apply custom az CLI path ──────────────────────────────────────────────
     if args.az_path:
-        _AZ_CMD   = [args.az_path]
         _AZ_EXE   = args.az_path
-        _AZ_SHELL = args.az_path.lower().endswith((".cmd", ".bat"))
+        _AZ_CMD   = [_AZ_EXE]
+        _AZ_SHELL = _AZ_EXE.lower().endswith((".cmd", ".bat"))
 
     # ── validate subscription_id ──────────────────────────────────────────────
     placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
@@ -3097,11 +3134,14 @@ def main():
 
     # "az account set" only changes the local CLI context — it does NOT modify any
     # Azure resource. Call subprocess directly to bypass the run_az write-verb guard.
-    acct_cmd = _AZ_CMD + ["account", "set", "--subscription", args.subscription_id, "--output", "none"]
-    subprocess.run(
-        " ".join(acct_cmd) if _AZ_SHELL else acct_cmd,
-        capture_output=True, text=True, timeout=30, shell=_AZ_SHELL
-    )
+    acct_parts = ["account", "set", "--subscription", args.subscription_id, "--output", "none"]
+    acct_cmd, acct_shell = _az_subprocess_args(acct_parts[:-2])   # without --output json
+    # rebuild without --output json suffix that _az_subprocess_args appends
+    if acct_shell:
+        acct_run = f'"{_AZ_EXE}" account set --subscription {args.subscription_id} --output none'
+    else:
+        acct_run = _AZ_CMD + ["account", "set", "--subscription", args.subscription_id, "--output", "none"]
+    subprocess.run(acct_run, capture_output=True, text=True, timeout=30, shell=acct_shell)
     tracker.log_info(f"Subscription   : {sub_info.get('name')} | Tenant: {sub_info.get('tenantId')}")
 
     start_time = time.time()
