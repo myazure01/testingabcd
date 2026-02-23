@@ -57,13 +57,19 @@ def run_az(args_list, verbose=False):
     try:
         result = subprocess.run(
             _AZ_CMD + args_list + ["--output", "json"],
-            capture_output=True, text=True, timeout=120
+            capture_output=True, text=True, timeout=120,
+            shell=_AZ_SHELL
         )
         if result.returncode != 0:
             if verbose:
                 print(f"[WARN] az {' '.join(args_list)}: {result.stderr[:200]}")
             return None
         return json.loads(result.stdout) if result.stdout.strip() else None
+    except FileNotFoundError:
+        print(f"[ERROR] Azure CLI not found at: {' '.join(_AZ_CMD)}")
+        print("        Install from: https://aka.ms/installazurecliwindows")
+        print("        Then restart this terminal and run again.")
+        sys.exit(1)
     except Exception as e:
         if verbose:
             print(f"[WARN] az {' '.join(args_list)}: {e}")
@@ -3038,6 +3044,7 @@ def main():
     # ── apply custom az CLI path ──────────────────────────────────────────────
     if args.az_path:
         _AZ_CMD = [args.az_path]
+        _AZ_SHELL = False   # explicit path — no shell needed
 
     # ── validate subscription_id ──────────────────────────────────────────────
     placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
@@ -3070,17 +3077,24 @@ def main():
         tracker.log_info(f"Included RGs   : {', '.join(args.included_resource_groups)}")
 
     # ── check az login ────────────────────────────────────────────────────────
-    sub_info = run_az(["account", "show"], args.verbose)
+    tracker.log_info(f"az CLI        : {' '.join(_AZ_CMD)}")
+    sub_info = run_az(["account", "show"], verbose=True)
     if not sub_info:
-        print("[ERROR] az CLI not logged in or not installed.")
-        print("        Run: az login")
+        # run_az exits on FileNotFoundError — reaching here means az IS present
+        # but not logged in or the token has expired
+        print("[ERROR] Azure CLI is installed but you are not logged in, "
+              "or your login session has expired.")
+        print("        Run:  az login")
+        print("        For a service principal:")
+        print("              az login --service-principal "
+              "-u <APP_ID> -p <SECRET> --tenant <TENANT_ID>")
         sys.exit(1)
 
     # "az account set" only changes the local CLI context — it does NOT modify any
     # Azure resource. Call subprocess directly to bypass the run_az write-verb guard.
     subprocess.run(
         _AZ_CMD + ["account", "set", "--subscription", args.subscription_id, "--output", "none"],
-        capture_output=True, text=True, timeout=30
+        capture_output=True, text=True, timeout=30, shell=_AZ_SHELL
     )
     tracker.log_info(f"Subscription   : {sub_info.get('name')} | Tenant: {sub_info.get('tenantId')}")
 
