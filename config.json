@@ -1,64 +1,34 @@
 {
-    "_comment": "====== AZURE AUTHENTICATION ======",
-    "_auth_note": "Uses Azure CLI login (az login) - DefaultAzureCredential",
-    "auth_method": "default",
-    
-    "_subscription_comment": "====== SUBSCRIPTION FILTERING ======",
-    "_subscription_instructions": [
-        "Option 1: Scan ALL subscriptions - Leave both arrays empty: [] []",
-        "Option 2: Filter by NAME - Use subscription_names: ['Production', 'Development']",
-        "Option 3: Filter by ID - Use subscription_ids: ['xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx']",
-        "Option 4: Mix both - Specify both names and IDs (will scan union of both)",
-        "Names are case-insensitive and support partial matching"
-    ],
-    "subscription_names": [],
+    "subscription_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
     "subscription_ids": [],
-    
-    "_comment_devops": "====== AZURE DEVOPS GIT REPOSITORIES ======",
-    "_devops_instructions": [
-        "1. Go to Azure DevOps -> User Settings -> Personal Access Tokens",
-        "2. Create PAT with 'Code (Read)' permission",
-        "3. Format: https://PAT_NAME:PAT_TOKEN@dev.azure.com/ORG/PROJECT/_git/REPO",
-        "4. Repositories can be strings (uses default branch) or objects with branch selection"
-    ],
-    
-    "azure_devops": {
-        "organization": "YOUR_ORG_NAME",
-        "pat_token": "YOUR_PERSONAL_ACCESS_TOKEN",
-        "projects": [
-            {
-                "project_name": "YOUR_PROJECT_NAME",
-                "repositories": [
-                    {"name": "YOUR_REPO1", "branch": "main"},
-                    {"name": "YOUR_REPO2", "branch": "develop"}
-                ]
-            }
-        ]
-    },
-    
-    "_repo_format_note": "Repository format: string 'repo-name' OR object {name: 'repo-name', branch: 'branch-name'}. If branch not specified, uses default branch.",
-    
-    "_git_repos_manual": "Or manually specify full URLs (overrides azure_devops config)",
-    "git_repos": [],
-    
-    "_comment_options": "====== DISCOVERY OPTIONS ======",
-    "output_dir": "discovery_output",
-    "scan_code": true,
-    "scan_network_flows": true,
-    "deep_dependency_analysis": true,
+    "subscription_names": [],
+    "output_dir": "./migration-output",
+    "parallel_workers": 8,
+    "skip_html": false,
+    "skip_excel": false,
+    "verbose": false,
     "excluded_resource_groups": [],
-    "log_level": "INFO",
-
-    "_comment_export": "====== RESOURCE PROPERTY EXPORT (Cross-Tenant Deployment) ======",
-    "_export_instructions": [
-        "export_resource_properties : true = fetch full ARM properties for every resource",
-        "export_deployment_package  : true = generate ARM templates + deploy scripts per RG",
-        "parallel_workers           : number of parallel 'az resource show' calls (1-20)",
-        "                             10 is the default and safe for most tenants.",
-        "                             Increase to 15-20 for faster export on large tenants.",
-        "                             Reduce to 5 if you see HTTP 429 rate-limit errors."
-    ],
-    "export_resource_properties": true,
-    "export_deployment_package": true,
-    "parallel_workers": 10
+    "included_resource_groups": [],
+    "collect_web_apps": true,
+    "collect_function_apps": true,
+    "collect_app_service_plans": true,
+    "collect_sql": true,
+    "collect_storage": true,
+    "collect_key_vaults": true,
+    "collect_networking": true,
+    "collect_app_gateways": true,
+    "collect_load_balancers": true,
+    "collect_traffic_managers": true,
+    "collect_managed_identities": true,
+    "collect_monitoring": true,
+    "collect_other_resources": false,
+    "https_proxy": "",
+    "no_proxy": "",
+    "az_path": "",
+    "scan_code": false,
+    "devops_organization": "",
+    "devops_pat_token": "",
+    "devops_projects": [],
+    "devops_repos": [],
+    "devops_branch": "main"
 }
