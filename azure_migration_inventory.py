@@ -1672,17 +1672,48 @@ class DependencyMapper:
             nodes_by_name[node["display_name"].lower()] = nid
 
         PATTERN_TO_REL = {
-            "SQL_SERVER_ENDPOINT":  "CODE_CONNECTS_TO_SQL",
-            "STORAGE_ENDPOINT":     "CODE_READS_WRITES_STORAGE",
-            "STORAGE_ACCOUNT_NAME": "CODE_READS_WRITES_STORAGE",
-            "KEY_VAULT_ENDPOINT":   "CODE_READS_KEYVAULT",
-            "KEY_VAULT_REF":        "CODE_READS_KEYVAULT",
-            "SERVICE_BUS_ENDPOINT": "CODE_USES_SERVICE_BUS",
-            "COSMOS_ENDPOINT":      "CODE_CONNECTS_TO_COSMOS",
-            "REDIS_ENDPOINT":       "CODE_CONNECTS_TO_REDIS",
-            "WEBAPP_ENDPOINT":      "CODE_CALLS_WEBAPP",
-            "APP_INSIGHTS_KEY":     "CODE_SENDS_TO_APP_INSIGHTS",
-            "APP_INSIGHTS_CONN":    "CODE_SENDS_TO_APP_INSIGHTS",
+            # Compute
+            "WEBAPP_ENDPOINT":             "CODE_CALLS_WEBAPP",
+            "CONTAINER_APP_ENDPOINT":      "CODE_CALLS_CONTAINER_APP",
+            "FRONTDOOR_ENDPOINT":          "CODE_BEHIND_FRONTDOOR",
+            "CDN_ENDPOINT":                "CODE_BEHIND_CDN",
+            # Data / Storage
+            "SQL_SERVER_ENDPOINT":         "CODE_CONNECTS_TO_SQL",
+            "HARDCODED_SQL_PASSWORD":      "CODE_CONNECTS_TO_SQL",
+            "STORAGE_ENDPOINT":            "CODE_READS_WRITES_STORAGE",
+            "STORAGE_ACCOUNT_NAME":        "CODE_READS_WRITES_STORAGE",
+            "HARDCODED_STORAGE_KEY":       "CODE_READS_WRITES_STORAGE",
+            "SAS_TOKEN":                   "CODE_READS_WRITES_STORAGE",
+            "COSMOS_ENDPOINT":             "CODE_CONNECTS_TO_COSMOS",
+            "COSMOS_CONN_STR":             "CODE_CONNECTS_TO_COSMOS",
+            "REDIS_ENDPOINT":              "CODE_CONNECTS_TO_REDIS",
+            "REDIS_CONN_STR":              "CODE_CONNECTS_TO_REDIS",
+            # Messaging / Events
+            "SERVICE_BUS_ENDPOINT":        "CODE_USES_SERVICE_BUS",
+            "SERVICEBUS_CONN_STR":         "CODE_USES_SERVICE_BUS",
+            "EVENTHUB_ENTITY":             "CODE_USES_EVENT_HUB",
+            "EVENTHUB_CONN_STR":           "CODE_USES_EVENT_HUB",
+            "EVENT_GRID_ENDPOINT":         "CODE_PUBLISHES_TO_EVENT_GRID",
+            "EVENT_GRID_KEY":              "CODE_PUBLISHES_TO_EVENT_GRID",
+            # Security / Identity
+            "KEY_VAULT_ENDPOINT":          "CODE_READS_KEYVAULT",
+            "KEY_VAULT_REF":               "CODE_READS_KEYVAULT",
+            # AI / Cognitive / Search
+            "COGNITIVE_ENDPOINT":          "CODE_CALLS_COGNITIVE_SERVICES",
+            "OPENAI_ENDPOINT":             "CODE_CALLS_AZURE_OPENAI",
+            "SEARCH_ENDPOINT":             "CODE_USES_AZURE_SEARCH",
+            "SEARCH_CONN_STR":             "CODE_USES_AZURE_SEARCH",
+            # Monitoring
+            "APP_INSIGHTS_KEY":            "CODE_SENDS_TO_APP_INSIGHTS",
+            "APP_INSIGHTS_CONN":           "CODE_SENDS_TO_APP_INSIGHTS",
+            "APP_INSIGHTS_SDK":            "CODE_SENDS_TO_APP_INSIGHTS",
+            # Registry / DevOps
+            "CONTAINER_REGISTRY_ENDPOINT": "CODE_PULLS_FROM_CONTAINER_REGISTRY",
+            # IoT / RT
+            "IOT_HUB_ENDPOINT":            "CODE_CONNECTS_TO_IOT_HUB",
+            "SIGNALR_ENDPOINT":            "CODE_USES_SIGNALR",
+            # Config
+            "APP_CONFIG_ENDPOINT":         "CODE_READS_APP_CONFIGURATION",
         }
 
         for f in findings:
@@ -2141,102 +2172,223 @@ class GitRepoScanner:
     endpoint patterns, hardcoded connection strings, and secret references."""
 
     # ── detection patterns ─────────────────────────────────────────────────────
+    # Each tuple: (pattern_type, regex, resource_name_capture_group, severity, is_secret)
+    # resource_name_capture_group: 1-based group index that holds the Azure resource name,
+    #   or 0 meaning no resource name is extractable from this pattern.
     _RAW_PATTERNS = [
-        # (pattern_type, regex, resource_name_group, severity, is_secret)
-        # — SQL Server endpoints
-        ("SQL_SERVER_ENDPOINT",
-         r'([\w-]+)\.database\.windows\.net',
-         1, "HIGH", False),
-        # — Storage endpoints (blob/queue/table/file/dfs)
-        ("STORAGE_ENDPOINT",
-         r'([\w-]+)\.(blob|queue|table|file|dfs)\.core\.windows\.net',
-         1, "HIGH", False),
-        # — Storage AccountName in connection string
-        ("STORAGE_ACCOUNT_NAME",
-         r'AccountName=([\w-]+)[;,\'"\s]',
-         1, "HIGH", False),
-        # — Key Vault endpoint
-        ("KEY_VAULT_ENDPOINT",
-         r'https://([\w-]+)\.vault\.azure\.net',
-         1, "HIGH", False),
-        # — Key Vault app setting reference
-        ("KEY_VAULT_REF",
-         r'@Microsoft\.KeyVault\((?:VaultName=([\w-]+)|SecretUri=https://([\w-]+)\.vault)',
-         1, "HIGH", False),
-        # — Service Bus endpoint
-        ("SERVICE_BUS_ENDPOINT",
-         r'([\w-]+)\.servicebus\.windows\.net',
-         1, "MEDIUM", False),
-        # — Cosmos DB endpoint
-        ("COSMOS_ENDPOINT",
-         r'([\w-]+)\.documents\.azure\.com',
-         1, "MEDIUM", False),
-        # — Redis Cache endpoint
-        ("REDIS_ENDPOINT",
-         r'([\w-]+)\.redis\.cache\.windows\.net',
-         1, "MEDIUM", False),
-        # — App Insights instrumentation key
-        ("APP_INSIGHTS_KEY",
-         r'InstrumentationKey=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
-         0, "MEDIUM", False),
-        # — App Insights connection string key present
-        ("APP_INSIGHTS_CONN",
-         r'APPLICATIONINSIGHTS_CONNECTION_STRING',
-         0, "LOW", False),
-        # — Azure Function / Web App hostname
+        # ── Compute / Hosting ────────────────────────────────────────────────
+        # Web App / Function App hostname (.azurewebsites.net)
         ("WEBAPP_ENDPOINT",
-         r'https://([\w-]+)\.azurewebsites\.net',
+         r'https?://([\w-]+)\.azurewebsites\.net',
+         1, "HIGH", False),
+        # Azure Container Apps endpoint
+        ("CONTAINER_APP_ENDPOINT",
+         r'https?://([\w-]+)\.azurecontainerapps\.io',
          1, "MEDIUM", False),
-        # — Azure Front Door hostname
+        # Azure Front Door
         ("FRONTDOOR_ENDPOINT",
          r'([\w-]+)\.azurefd\.net',
          1, "MEDIUM", False),
-        # — Azure CDN endpoint
+        # Azure CDN
         ("CDN_ENDPOINT",
          r'([\w-]+)\.azureedge\.net',
          1, "LOW", False),
-        # — Event Hub endpoint
-        ("EVENTHUB_ENDPOINT",
-         r'([\w-]+)\.servicebus\.windows\.net.*EntityPath=([\w-]+)',
+
+        # ── Data / Storage ───────────────────────────────────────────────────
+        # SQL Server FQDN
+        ("SQL_SERVER_ENDPOINT",
+         r'([\w-]+)\.database\.windows\.net',
+         1, "HIGH", False),
+        # Storage service endpoints (blob/queue/table/file/dfs)
+        ("STORAGE_ENDPOINT",
+         r'([\w-]+)\.(blob|queue|table|file|dfs)\.core\.windows\.net',
+         1, "HIGH", False),
+        # Storage connection string AccountName
+        ("STORAGE_ACCOUNT_NAME",
+         r'AccountName=([\w-]+)[;,\'"\s]',
+         1, "HIGH", False),
+        # Cosmos DB SQL API endpoint
+        ("COSMOS_ENDPOINT",
+         r'https?://([\w-]+)\.documents\.azure\.com',
+         1, "HIGH", False),
+        # Cosmos DB account name in env var patterns
+        ("COSMOS_CONN_STR",
+         r'(?:CosmosDb|COSMOS(?:DB)?)[_\-]?(?:CONNECTION[_\-]?STRING|ENDPOINT|ACCOUNT'  # noqa
+         r'|URI|HOST)\s*[=:]\s*[\"\']?([\w-]+)',
+         1, "HIGH", False),
+        # Redis Cache endpoint
+        ("REDIS_ENDPOINT",
+         r'([\w-]+)\.redis\.cache\.windows\.net',
+         1, "HIGH", False),
+        # Redis env var pattern
+        ("REDIS_CONN_STR",
+         r'(?:REDIS|CACHE)[_\-]?(?:CONNECTION[_\-]?STRING|HOST|ENDPOINT)\s*[=:]\s*[\"\']?([\w-]+)',
          1, "MEDIUM", False),
-        # — Hardcoded SQL password
+
+        # ── Messaging / Events ───────────────────────────────────────────────
+        # Service Bus namespace endpoint (also matches Event Hub namespace)
+        ("SERVICE_BUS_ENDPOINT",
+         r'([\w-]+)\.servicebus\.windows\.net',
+         1, "HIGH", False),
+        # Event Hub: explicit EntityPath (hub name in group 2)
+        ("EVENTHUB_ENTITY",
+         r'([\w-]+)\.servicebus\.windows\.net[^\n]*EntityPath=([\w-]+)',
+         2, "HIGH", False),
+        # Service Bus SDK env var reference
+        ("SERVICEBUS_CONN_STR",
+         r'(?:SERVICE[_\-]?BUS|AzureServiceBus|AzureWebJobsServiceBus)[_\-]?(?:CONNECTION[_\-]?STRING)?\s*[=:]\s*[\"\']?([\w-]+)',
+         1, "HIGH", False),
+        # Event Hub SDK env var reference
+        ("EVENTHUB_CONN_STR",
+         r'(?:EVENT[_\-]?HUB|AzureWebJobsEventHub|EventHubConnection)[_\-]?(?:CONNECTION[_\-]?STRING)?\s*[=:]\s*[\"\']?([\w-]+)',
+         1, "HIGH", False),
+        # Event Grid topic endpoint
+        ("EVENT_GRID_ENDPOINT",
+         r'https?://([\w-]+)\.(?:[\w-]+\.)?eventgrid\.azure\.net',
+         1, "HIGH", False),
+        # Event Grid topic key env var
+        ("EVENT_GRID_KEY",
+         r'(?:EVENT[_\-]?GRID|EVENTGRID)[_\-]?(?:KEY|TOPIC[_\-]?KEY|ACCESS[_\-]?KEY)\s*[=:]\s*[\"\']?([\w+/=]{10,})',
+         0, "HIGH", True),
+
+        # ── Security / Identity ──────────────────────────────────────────────
+        # Key Vault FQDN
+        ("KEY_VAULT_ENDPOINT",
+         r'https?://([\w-]+)\.vault\.azure\.net',
+         1, "HIGH", False),
+        # Key Vault @Microsoft.KeyVault() reference
+        ("KEY_VAULT_REF",
+         r'@Microsoft\.KeyVault\((?:VaultName=([\w-]+)|SecretUri=https://([\w-]+)\.vault)',
+         1, "HIGH", False),
+
+        # ── AI / Cognitive / Search ──────────────────────────────────────────
+        # Cognitive Services endpoint
+        ("COGNITIVE_ENDPOINT",
+         r'https?://([\w-]+)\.cognitiveservices\.azure\.com',
+         1, "MEDIUM", False),
+        # Azure OpenAI endpoint
+        ("OPENAI_ENDPOINT",
+         r'https?://([\w-]+)\.openai\.azure\.com',
+         1, "MEDIUM", False),
+        # Azure Cognitive Search endpoint
+        ("SEARCH_ENDPOINT",
+         r'https?://([\w-]+)\.search\.windows\.net',
+         1, "MEDIUM", False),
+        # Azure Search env var pattern
+        ("SEARCH_CONN_STR",
+         r'(?:AZURE[_\-]?SEARCH|SEARCH[_\-]?SERVICE)[_\-]?(?:ENDPOINT|NAME|KEY|URL)\s*[=:]\s*[\"\']?([\w-]+)',
+         1, "MEDIUM", False),
+
+        # ── Monitoring / Observability ───────────────────────────────────────
+        # App Insights instrumentation key (GUID)
+        ("APP_INSIGHTS_KEY",
+         r'InstrumentationKey=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+         0, "MEDIUM", False),
+        # App Insights connection string env var
+        ("APP_INSIGHTS_CONN",
+         r'APPLICATIONINSIGHTS[_\-]CONNECTION[_\-]STRING',
+         0, "MEDIUM", False),
+        # App Insights SDK: ApplicationInsights.config or code reference
+        ("APP_INSIGHTS_SDK",
+         r'(?:TelemetryClient|ApplicationInsights|ILogger).*(?:InstrumentationKey|ConnectionString)',
+         0, "LOW", False),
+
+        # ── DevOps / Registry ────────────────────────────────────────────────
+        # Azure Container Registry
+        ("CONTAINER_REGISTRY_ENDPOINT",
+         r'([\w-]+)\.azurecr\.io',
+         1, "MEDIUM", False),
+
+        # ── IoT / RT Communication ───────────────────────────────────────────
+        # Azure IoT Hub endpoint
+        ("IOT_HUB_ENDPOINT",
+         r'([\w-]+)\.azure-devices\.net',
+         1, "MEDIUM", False),
+        # Azure SignalR endpoint
+        ("SIGNALR_ENDPOINT",
+         r'https?://([\w-]+)\.service\.signalr\.net',
+         1, "MEDIUM", False),
+
+        # ── Configuration ────────────────────────────────────────────────────
+        # Azure App Configuration store endpoint
+        ("APP_CONFIG_ENDPOINT",
+         r'https?://([\w-]+)\.azconfig\.io',
+         1, "MEDIUM", False),
+
+        # ── Secrets / Keys (always is_secret=True) ───────────────────────────
+        # Hardcoded SQL password in connection string
         ("HARDCODED_SQL_PASSWORD",
          r'[Pp]assword\s*=\s*(?!\{|\$|%|@|<)([^;"\'{\s]{3,})',
          0, "HIGH", True),
-        # — Hardcoded storage account key (base64 pattern, 88 chars)
+        # Hardcoded storage account key (base64, 88 chars)
         ("HARDCODED_STORAGE_KEY",
          r'AccountKey=([A-Za-z0-9+/]{40,}={0,2})',
          0, "HIGH", True),
-        # — SAS token
+        # SAS token in query string
         ("SAS_TOKEN",
          r'[?&]sv=\d{4}-\d{2}-\d{2}&',
          0, "HIGH", True),
-        # — Private key / certificate pattern
+        # Private key / certificate PEM header
         ("PRIVATE_KEY",
          r'-----BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY-----',
          0, "HIGH", True),
-        # — Generic API key pattern (common env var names)
+        # Generic hardcoded credentials (env var name patterns)
         ("GENERIC_SECRET",
-         r'(?:API_KEY|SECRET_KEY|CLIENT_SECRET|ACCESS_TOKEN|AUTH_TOKEN)\s*[=:]\s*[^\s"\'{<>]{8,}',
+         r'(?:API_KEY|SECRET_KEY|CLIENT_SECRET|ACCESS_TOKEN|AUTH_TOKEN|ACCOUNT_KEY)'  # noqa
+         r'\s*[=:]\s*[^\s"\'{<>]{8,}',
          0, "HIGH", True),
     ]
 
     _COMPILED = [(ptype, re.compile(pat, re.IGNORECASE), grp, sev, is_sec)
                  for ptype, pat, grp, sev, is_sec in _RAW_PATTERNS]
 
-    # Pattern type → which inventory resource type it maps to
+    # Pattern type → inventory resource type (None = external/untracked service)
     _TYPE_TO_RES = {
-        "SQL_SERVER_ENDPOINT":  "sql_servers",
-        "STORAGE_ENDPOINT":     "storage_accounts",
-        "STORAGE_ACCOUNT_NAME": "storage_accounts",
-        "KEY_VAULT_ENDPOINT":   "key_vaults",
-        "KEY_VAULT_REF":        "key_vaults",
-        "SERVICE_BUS_ENDPOINT": None,
-        "COSMOS_ENDPOINT":      None,
-        "REDIS_ENDPOINT":       None,
-        "WEBAPP_ENDPOINT":      "web_apps",
-        "APP_INSIGHTS_KEY":     "app_insights",
-        "APP_INSIGHTS_CONN":    "app_insights",
+        # Compute
+        "WEBAPP_ENDPOINT":              "web_apps",
+        "CONTAINER_APP_ENDPOINT":       "other_resources",
+        "FRONTDOOR_ENDPOINT":           "other_resources",
+        "CDN_ENDPOINT":                 "other_resources",
+        # Data / Storage
+        "SQL_SERVER_ENDPOINT":          "sql_servers",
+        "STORAGE_ENDPOINT":             "storage_accounts",
+        "STORAGE_ACCOUNT_NAME":         "storage_accounts",
+        "COSMOS_ENDPOINT":              "other_resources",
+        "COSMOS_CONN_STR":              "other_resources",
+        "REDIS_ENDPOINT":               "other_resources",
+        "REDIS_CONN_STR":               "other_resources",
+        # Messaging / Events
+        "SERVICE_BUS_ENDPOINT":         "other_resources",
+        "EVENTHUB_ENTITY":              "other_resources",
+        "SERVICEBUS_CONN_STR":          "other_resources",
+        "EVENTHUB_CONN_STR":            "other_resources",
+        "EVENT_GRID_ENDPOINT":          "event_grid_topics",
+        "EVENT_GRID_KEY":               "event_grid_topics",
+        # Security / Identity
+        "KEY_VAULT_ENDPOINT":           "key_vaults",
+        "KEY_VAULT_REF":                "key_vaults",
+        # AI / Cognitive / Search
+        "COGNITIVE_ENDPOINT":           "other_resources",
+        "OPENAI_ENDPOINT":              "other_resources",
+        "SEARCH_ENDPOINT":              "other_resources",
+        "SEARCH_CONN_STR":              "other_resources",
+        # Monitoring
+        "APP_INSIGHTS_KEY":             "app_insights",
+        "APP_INSIGHTS_CONN":            "app_insights",
+        "APP_INSIGHTS_SDK":             "app_insights",
+        # Registry / DevOps
+        "CONTAINER_REGISTRY_ENDPOINT":  "other_resources",
+        # IoT / RT
+        "IOT_HUB_ENDPOINT":             "other_resources",
+        "SIGNALR_ENDPOINT":             "other_resources",
+        # Config
+        "APP_CONFIG_ENDPOINT":          "other_resources",
+        # Secrets
+        "HARDCODED_SQL_PASSWORD":       "sql_servers",
+        "HARDCODED_STORAGE_KEY":        "storage_accounts",
+        "SAS_TOKEN":                    "storage_accounts",
+        "PRIVATE_KEY":                  None,
+        "GENERIC_SECRET":               None,
     }
 
     def __init__(self, args, tracker):
@@ -2244,9 +2396,13 @@ class GitRepoScanner:
         self.tracker = tracker
         self._org    = getattr(args, "devops_organization", "").strip()
         self._pat    = getattr(args, "devops_pat_token",    "").strip()
-        self._projects_filter = [p.lower() for p in getattr(args, "devops_projects", [])]
-        self._repos_filter    = [r.lower() for r in getattr(args, "devops_repos",    [])]
+        self._projects_filter = [p.lower() for p in getattr(args, "devops_projects", []) if p]
+        self._repos_filter    = [r.lower() for r in getattr(args, "devops_repos",    []) if r]
         self._branch          = getattr(args, "devops_branch",    "main")
+        # Per-repo branch overrides: {repo_name_lower: branch} — populated when config.json
+        # specifies repositories as objects with a "branch" field.
+        self._repo_branch_map = {k.lower(): v
+                                 for k, v in (getattr(args, "devops_repo_branch_map", {}) or {}).items()}
         self._depth           = getattr(args, "git_clone_depth",  1)
         self._workers         = getattr(args, "git_clone_workers", 3)
         self._max_kb          = getattr(args, "git_max_file_kb",  512)
@@ -2369,7 +2525,12 @@ class GitRepoScanner:
         repo_dir = Path(tmpdir) / f"{repo['project']}__{repo['name']}"
         repo_dir.mkdir(parents=True, exist_ok=True)
 
-        branch = self._branch or repo["default_branch"] or "main"
+        # Per-repo branch from config takes priority, then global devops_branch,
+        # then the repo's own default branch reported by the DevOps API.
+        branch = (self._repo_branch_map.get(repo["name"].lower())
+                  or self._branch
+                  or repo["default_branch"]
+                  or "main")
 
         # READ-ONLY git environment: disable all credential prompts,
         # prevent any accidental push, disable system/global git config
@@ -2518,40 +2679,118 @@ class GitRepoScanner:
     @staticmethod
     def cross_reference(findings, inventory):
         """Mark findings as confirmed if the resource name is found in inventory.
-        Also builds a reverse index: repo_name -> [matching_app_names]."""
-        # build resource name index from inventory
-        res_index = {}   # res_type -> set of lower names
+        Also builds a reverse index: repo_name -> [matching_app_names].
+
+        Matching strategy (in order):
+          1. Exact resource-name lookup in inventory (SQL, Storage, KV, etc.)
+          2. For SERVICE_BUS_ENDPOINT / EVENTHUB_ENTITY: match namespace prefix against
+             event_grid_topics, other_resources by resource name
+          3. Repo-to-App matching uses five strategies, all case-insensitive:
+             a. Substring: app_name ⊂ repo_name OR repo_name ⊂ app_name
+             b. Normalized (strip hyphens/underscores): same substring check
+             c. Hostname: if code references <name>.azurewebsites.net, match to that app
+             d. App-setting value: if an app setting VALUE contains the repo name
+             e. defaultHostName prefix match
+        """
+        # ── 1. Build resource name index ─────────────────────────────────────
+        res_index = {}   # res_type -> {lower_name: resource_dict}
         for rg_data in inventory.get("resource_groups", {}).values():
             for res_type, res_list in rg_data.get("resources", {}).items():
-                if res_type not in res_index:
-                    res_index[res_type] = {}
+                bucket = res_index.setdefault(res_type, {})
                 for res in res_list:
-                    n = res.get("name", "").lower()
-                    res_index[res_type][n] = res
+                    bucket[res.get("name", "").lower()] = res
 
-        # build repo -> app name mapping (fuzzy: repo name contains app name or vice versa)
-        all_apps = {}
+        # Flat name lookup across ALL resource types (for patterns that don't have a
+        # specific res_type, e.g. SERVICE_BUS_ENDPOINT could be a Service Bus namespace
+        # or Event Hub namespace both ending in .servicebus.windows.net)
+        all_resource_names = {}   # lower_name -> (res_type, resource_dict)
+        for res_type, bucket in res_index.items():
+            for name_lower, res in bucket.items():
+                all_resource_names[name_lower] = (res_type, res)
+
+        # ── 2. Build repo → app mapping ───────────────────────────────────────
+        # Collect all web apps + function apps with multiple lookup keys
+        all_apps = {}  # lower_name -> (rg_name, res_type, app_dict)
+        app_hostname_map = {}  # lower_hostname_prefix -> (rg_name, res_type, app_dict)
         for rg_name, rg_data in inventory.get("resource_groups", {}).items():
             for rt in ("web_apps", "function_apps"):
                 for app in rg_data.get("resources", {}).get(rt, []):
-                    all_apps[app["name"].lower()] = (rg_name, rt, app)
+                    aname_lc = app["name"].lower()
+                    all_apps[aname_lc] = (rg_name, rt, app)
+                    # index by defaultHostName prefix (the part before .azurewebsites.net)
+                    dhn = (app.get("defaultHostName") or "").lower()
+                    if dhn:
+                        app_hostname_map[dhn] = (rg_name, rt, app)
+                        prefix = dhn.split(".azurewebsites.net")[0]
+                        app_hostname_map[prefix] = (rg_name, rt, app)
 
+        def _normalize(s):
+            """Strip hyphens and underscores for fuzzy matching."""
+            return re.sub(r'[-_]', '', s.lower())
+
+        def _match_repo_to_apps(repo_name):
+            repo_lc   = repo_name.lower()
+            repo_norm = _normalize(repo_name)
+            matches   = []
+            seen      = set()
+
+            def _add(app_name, rg, rt):
+                if app_name not in seen:
+                    seen.add(app_name)
+                    matches.append({"app_name": app_name, "rg": rg,
+                                    "resource_type": rt})
+
+            for aname_lc, (rg, rt, app) in all_apps.items():
+                # (a) substring match
+                if aname_lc in repo_lc or repo_lc in aname_lc:
+                    _add(app["name"], rg, rt)
+                    continue
+                # (b) normalized substring match (handles hyphens vs underscores)
+                anorm = _normalize(aname_lc)
+                if anorm and (anorm in repo_norm or repo_norm in anorm):
+                    _add(app["name"], rg, rt)
+                    continue
+                # (d) app setting VALUE references the repo name
+                for s in (app.get("app_setting_keys") or []):
+                    if repo_lc in s.lower():
+                        _add(app["name"], rg, rt)
+                        break
+            return matches
+
+        # ── 3. Iterate findings: confirm + build repo_to_apps ─────────────────
         repo_to_apps = {}
         for finding in findings:
             repo_lc = finding["repo_name"].lower()
-            if repo_lc not in repo_to_apps:
-                matches = []
-                for app_name, (rg, rt, app) in all_apps.items():
-                    if app_name in repo_lc or repo_lc in app_name:
-                        matches.append({"app_name": app["name"], "rg": rg,
-                                        "resource_type": rt})
-                repo_to_apps[repo_lc] = matches
 
-            # mark finding as confirmed if resource found in inventory
+            # Populate repo_to_apps once per repo
+            if repo_lc not in repo_to_apps:
+                repo_to_apps[repo_lc] = _match_repo_to_apps(finding["repo_name"])
+
+            # (c) hostname: WEBAPP_ENDPOINT findings contain the app's hostname prefix
+            if finding.get("pattern_type") == "WEBAPP_ENDPOINT":
+                rname_lc = finding.get("matched_resource_name", "").lower()
+                if rname_lc in app_hostname_map:
+                    rg, rt, app = app_hostname_map[rname_lc]
+                    entry = {"app_name": app["name"], "rg": rg, "resource_type": rt}
+                    if entry not in repo_to_apps[repo_lc]:
+                        repo_to_apps[repo_lc].append(entry)
+                    finding["confirmed_in_inventory"] = True
+                    finding["matched_resource_name"]  = app["name"]
+                    continue
+
+            # Confirm finding if matched resource name is in inventory
             rt_inv = finding.get("inventory_resource_type", "")
             rname  = finding.get("matched_resource_name", "").lower()
-            if rt_inv and rname and rname in res_index.get(rt_inv, {}):
-                finding["confirmed_in_inventory"] = True
+            if rname:
+                # Try the specific resource type first
+                if rt_inv and rname in res_index.get(rt_inv, {}):
+                    finding["confirmed_in_inventory"] = True
+                # Fall back to global name search across all types
+                elif rname in all_resource_names:
+                    finding["confirmed_in_inventory"] = True
+                    # Fill in the correct resource type if it was missing/other
+                    if not rt_inv or rt_inv == "other_resources":
+                        finding["inventory_resource_type"] = all_resource_names[rname][0]
 
         return repo_to_apps
 
@@ -2565,8 +2804,9 @@ def resolve_subscriptions(args, tracker):
 
     Returns a list of {"id": ..., "name": ...} dicts for every matched subscription.
     """
-    sub_ids_cfg   = list(getattr(args, "subscription_ids",   []))
-    sub_names_cfg = list(getattr(args, "subscription_names", []))
+    sub_ids_cfg   = [s.strip() for s in getattr(args, "subscription_ids",   []) if str(s).strip()]
+    sub_names_cfg = [s.strip() for s in getattr(args, "subscription_names", []) if str(s).strip()]
+    ids_lower     = [i.lower() for i in sub_ids_cfg]
     names_lower   = [n.lower() for n in sub_names_cfg]
 
     if not sub_ids_cfg and not sub_names_cfg:
@@ -2592,12 +2832,14 @@ def resolve_subscriptions(args, tracker):
     matched  = []
     seen_ids = set()
     for sub in all_subs:
-        sub_id   = sub.get("id") or sub.get("subscriptionId", "")
+        sub_id   = (sub.get("id") or sub.get("subscriptionId", "")).strip()
         sub_name = sub.get("name", "")
-        if sub.get("state", "Enabled") != "Enabled":
-            continue
-        by_id   = sub_id in sub_ids_cfg
+        sub_state = sub.get("state", "Enabled")
+        by_id   = sub_id.lower() in ids_lower
         by_name = any(n in sub_name.lower() for n in names_lower)
+        # Only skip non-Enabled subscriptions when they weren't explicitly requested by ID/name
+        if sub_state != "Enabled" and not by_id and not by_name:
+            continue
         if (by_id or by_name) and sub_id not in seen_ids:
             matched.append({"id": sub_id, "name": sub_name})
             seen_ids.add(sub_id)
@@ -3434,6 +3676,43 @@ def parse_args():
     if args.config_path:
         cfg = load_config(args.config_path)
 
+    # ── Unpack nested azure_devops block into the flat devops_* keys the rest
+    # of the script expects.  config.json stores it as:
+    #   "azure_devops": { "organization": "...", "pat_token": "...",
+    #                      "projects": [ {"project_name": ..., "repositories": [...]} ] }
+    # We flatten it so devops_organization / devops_pat_token / devops_projects /
+    # devops_repos can be read by the defaults loop below exactly like any other key.
+    _PLACEHOLDER = lambda s: "YOUR_" in str(s).upper()
+    _adv = cfg.get("azure_devops") or {}
+    if _adv:
+        cfg.setdefault("devops_organization", _adv.get("organization", ""))
+        cfg.setdefault("devops_pat_token",    _adv.get("pat_token",    ""))
+        _projs_raw = _adv.get("projects") or []
+        # Flat project-name filter (skip placeholder names)
+        if not cfg.get("devops_projects"):
+            cfg["devops_projects"] = [
+                p.get("project_name", "") for p in _projs_raw
+                if p.get("project_name") and not _PLACEHOLDER(p["project_name"])
+            ]
+        # Flat repo-name filter + per-repo branch map
+        _repo_names, _repo_branch_map = [], {}
+        for _proj in _projs_raw:
+            for _repo in (_proj.get("repositories") or []):
+                _rname  = _repo if isinstance(_repo, str) else _repo.get("name", "")
+                _branch = "" if isinstance(_repo, str) else _repo.get("branch", "")
+                if _rname and not _PLACEHOLDER(_rname):
+                    _repo_names.append(_rname)
+                    if _branch:
+                        _repo_branch_map[_rname.lower()] = _branch
+        if _repo_names and not cfg.get("devops_repos"):
+            cfg["devops_repos"] = _repo_names
+        # Store the full per-repo branch map so GitRepoScanner can pick the right branch
+        cfg.setdefault("devops_repo_branch_map", _repo_branch_map)
+        # If azure_devops config has real org+pat, enable code scanning automatically
+        if (cfg.get("devops_organization") and not _PLACEHOLDER(cfg["devops_organization"])
+                and cfg.get("devops_pat_token") and not _PLACEHOLDER(cfg["devops_pat_token"])):
+            cfg.setdefault("scan_code", True)
+
     # Attach all config values as attributes so the rest of the script can read them
     # (CLI args already override via argparse defaults above)
     defaults = {
@@ -3453,6 +3732,7 @@ def parse_args():
         "collect_traffic_managers":   True,
         "collect_managed_identities": True,
         "collect_monitoring":         True,
+        "collect_event_grid":          True,
         "collect_other_resources":    False,
         "https_proxy":                "",
         "no_proxy":                   "",
@@ -3465,6 +3745,7 @@ def parse_args():
         "devops_projects":            [],
         "devops_repos":               [],
         "devops_branch":              "main",
+        "devops_repo_branch_map":     {},   # {repo_name_lower: branch} per-repo override
         "git_clone_depth":            1,
         "git_clone_workers":          3,
         "git_max_file_kb":            512,
