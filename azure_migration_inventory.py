@@ -1,4 +1,4 @@
-import subprocess, json, os, sys, re, argparse, datetime, time
+﻿import subprocess, json, os, sys, re, argparse, datetime, time
 import threading, shutil, csv
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -84,10 +84,11 @@ _AZ_WRITE_VERBS = frozenset({
     "restart", "scale", "swap", "publish", "trigger", "invoke",
 })
 
-def run_az(args_list, verbose=False):
+def run_az(args_list, verbose=False, subscription_id=None):
     """Run an az CLI command and return parsed JSON, or None on error.
     This script is permanently READ-ONLY. Any call containing a write verb
     (create/update/delete/set/assign/…) raises RuntimeError immediately.
+    Pass subscription_id to target a specific subscription without az account set.
     """
     # ── Read-only guard ───────────────────────────────────────────────────────────
     forbidden = [v for v in args_list if str(v).lower() in _AZ_WRITE_VERBS]
@@ -95,6 +96,9 @@ def run_az(args_list, verbose=False):
         raise RuntimeError(
             f"READ-ONLY VIOLATION: az command contains write verb(s) {forbidden}. "
             f"Full args: {args_list}")
+    # Inject --subscription so each call is explicitly scoped (safe for parallel runs)
+    if subscription_id:
+        args_list = list(args_list) + ["--subscription", subscription_id]
     try:
         cmd, use_shell = _az_subprocess_args(args_list)
         result = subprocess.run(
@@ -208,9 +212,17 @@ class ProgressTracker:
 # ── AzureInventoryCollector ───────────────────────────────────────────────────
 class AzureInventoryCollector:
 
-    def __init__(self, args, tracker):
+    def __init__(self, args, tracker, subscription_id=None):
         self.args = args
         self.tracker = tracker
+        self._sub_id = subscription_id
+        # _az is a bound helper that passes --subscription to every az call,
+        # enabling fully parallel multi-subscription scanning without az account set.
+        if subscription_id:
+            from functools import partial
+            self._az = partial(run_az, subscription_id=subscription_id)
+        else:
+            self._az = run_az
 
     @staticmethod
     def _empty_resources():
@@ -222,13 +234,16 @@ class AzureInventoryCollector:
             "private_dns_zones", "application_gateways", "waf_policies",
             "load_balancers", "traffic_managers", "managed_identities",
             "log_analytics_workspaces", "app_insights", "diagnostic_settings",
-            "alert_rules", "other_resources",
+            "alert_rules", "action_groups", "activity_log_alerts",
+            "scheduled_query_alerts", "smart_detector_alert_rules",
+            "event_grid_topics", "event_grid_domains",
+            "other_resources",
         ]}
 
     def collect_all(self):
-        sub = run_az(["account", "show"]) or {}
-        all_rgs = run_az(["group", "list"]) or []
-        flat = run_az(["resource", "list"]) or []
+        sub = self._az(["account", "show"]) or {}
+        all_rgs = self._az(["group", "list"]) or []
+        flat = self._az(["resource", "list"]) or []
 
         rg_counts = {}
         for res in flat:
@@ -282,13 +297,21 @@ class AzureInventoryCollector:
                 inventory["resource_groups"][rg_name] = rg_dict
 
         out = Path(self.args.output_dir)
-        (out / "raw-data" / "inventory-by-resource-group.json").write_text(
+        # Use a per-subscription filename when scanning in parallel to avoid
+        # race conditions when multiple subscriptions are collected concurrently.
+        # The merged result is written by collect_inventory() after all subs finish.
+        if self._sub_id:
+            safe_sub = self._sub_id.replace("/", "_").replace("\\", "_")
+            fname = f"inventory-sub-{safe_sub}.json"
+        else:
+            fname = "inventory-by-resource-group.json"
+        (out / "raw-data" / fname).write_text(
             json.dumps(inventory, indent=2), encoding="utf-8"
         )
         return inventory
 
     def _collect_rg(self, rg_name, rg_location):
-        tags = safe_get(run_az(["group", "show", "--name", rg_name]), "tags") or {}
+        tags = safe_get(self._az(["group", "show", "--name", rg_name]), "tags") or {}
         rg_dict = {
             "metadata": {"name": rg_name, "location": rg_location,
                          "tags": tags, "provisioningState": "Succeeded"},
@@ -311,6 +334,7 @@ class AzureInventoryCollector:
             ("collect_traffic_managers",    self.collect_traffic_managers),
             ("collect_managed_identities",  self.collect_managed_identities),
             ("collect_monitoring",          self.collect_monitoring),
+            ("collect_event_grid",          self.collect_event_grid),
             ("collect_other_resources",     self.collect_other_resources),
         ]
         collectors = [fn for flag, fn in FLAG_MAP if getattr(a, flag, True)]
@@ -341,12 +365,12 @@ class AzureInventoryCollector:
         cmd = "functionapp" if is_func else "webapp"
         futures = {}
         with ThreadPoolExecutor(max_workers=3) as ex:
-            futures["show"]     = ex.submit(run_az, [cmd, "show", "-n", name, "-g", rg])
-            futures["settings"] = ex.submit(run_az, [cmd, "config", "appsettings", "list", "-n", name, "-g", rg])
-            futures["conn"]     = ex.submit(run_az, [cmd, "config", "connection-string", "list", "-n", name, "-g", rg])
-            futures["vnet"]     = ex.submit(run_az, [cmd, "vnet-integration", "list", "-g", rg, "-n", name])
-            futures["slots"]    = ex.submit(run_az, [cmd, "deployment", "slot", "list", "-g", rg, "-n", name])
-            futures["ident"]    = ex.submit(run_az, [cmd, "identity", "show", "-g", rg, "-n", name])
+            futures["show"]     = ex.submit(self._az, [cmd, "show", "-n", name, "-g", rg])
+            futures["settings"] = ex.submit(self._az, [cmd, "config", "appsettings", "list", "-n", name, "-g", rg])
+            futures["conn"]     = ex.submit(self._az, [cmd, "config", "connection-string", "list", "-n", name, "-g", rg])
+            futures["vnet"]     = ex.submit(self._az, [cmd, "vnet-integration", "list", "-g", rg, "-n", name])
+            futures["slots"]    = ex.submit(self._az, [cmd, "deployment", "slot", "list", "-g", rg, "-n", name])
+            futures["ident"]    = ex.submit(self._az, [cmd, "identity", "show", "-g", rg, "-n", name])
 
         res = {k: (f.result() or ([] if k in ("settings", "conn", "vnet", "slots") else None))
                for k, f in futures.items()}
@@ -437,7 +461,7 @@ class AzureInventoryCollector:
         return d
 
     def collect_web_apps(self, rg):
-        apps = run_az(["webapp", "list", "--resource-group", rg]) or []
+        apps = self._az(["webapp", "list", "--resource-group", rg]) or []
         result = []
         for app in apps:
             try:
@@ -449,7 +473,7 @@ class AzureInventoryCollector:
         return {"web_apps": result}
 
     def collect_function_apps(self, rg):
-        apps = run_az(["functionapp", "list", "--resource-group", rg]) or []
+        apps = self._az(["functionapp", "list", "--resource-group", rg]) or []
         result = []
         for app in apps:
             try:
@@ -462,7 +486,7 @@ class AzureInventoryCollector:
 
     # ── Prompt 6: App Service Plan + SQL collectors ───────────────────────────
     def collect_app_service_plans(self, rg):
-        plans = run_az(["appservice", "plan", "list", "--resource-group", rg]) or []
+        plans = self._az(["appservice", "plan", "list", "--resource-group", rg]) or []
         result = []
         for p in plans:
             name = p.get("name", "")
@@ -488,7 +512,7 @@ class AzureInventoryCollector:
         return {"app_service_plans": result}
 
     def collect_sql(self, rg):
-        servers = run_az(["sql", "server", "list", "--resource-group", rg]) or []
+        servers = self._az(["sql", "server", "list", "--resource-group", rg]) or []
         server_dicts = []
         db_dicts = []
 
@@ -496,11 +520,11 @@ class AzureInventoryCollector:
             svr = svr_obj.get("name", "")
             futures = {}
             with ThreadPoolExecutor(max_workers=3) as ex:
-                futures["show"]     = ex.submit(run_az, ["sql", "server", "show", "-n", svr, "-g", rg])
-                futures["fw_rules"] = ex.submit(run_az, ["sql", "server", "firewall-rule", "list", "-g", rg, "-s", svr])
-                futures["vnet_r"]   = ex.submit(run_az, ["sql", "server", "vnet-rule", "list", "-g", rg, "-s", svr])
-                futures["ad_admin"] = ex.submit(run_az, ["sql", "server", "ad-admin", "list", "-g", rg, "--server-name", svr])
-                futures["dbs"]      = ex.submit(run_az, ["sql", "db", "list", "-g", rg, "-s", svr])
+                futures["show"]     = ex.submit(self._az, ["sql", "server", "show", "-n", svr, "-g", rg])
+                futures["fw_rules"] = ex.submit(self._az, ["sql", "server", "firewall-rule", "list", "-g", rg, "-s", svr])
+                futures["vnet_r"]   = ex.submit(self._az, ["sql", "server", "vnet-rule", "list", "-g", rg, "-s", svr])
+                futures["ad_admin"] = ex.submit(self._az, ["sql", "server", "ad-admin", "list", "-g", rg, "--server-name", svr])
+                futures["dbs"]      = ex.submit(self._az, ["sql", "db", "list", "-g", rg, "-s", svr])
 
             show     = futures["show"].result()
             fw_rules = futures["fw_rules"].result() or []
@@ -537,10 +561,10 @@ class AzureInventoryCollector:
             for db in [d for d in dbs if d.get("name") != "master"]:
                 db_name = db.get("name", "")
                 with ThreadPoolExecutor(max_workers=2) as ex:
-                    f_show = ex.submit(run_az, ["sql", "db", "show", "-g", rg, "-s", svr, "-n", db_name])
-                    f_tde  = ex.submit(run_az, ["sql", "db", "tde", "show", "-g", rg, "-s", svr, "-n", db_name])
-                    f_ltr  = ex.submit(run_az, ["sql", "db", "ltr-policy", "show", "-g", rg, "-s", svr, "-n", db_name])
-                    f_str  = ex.submit(run_az, ["sql", "db", "str-policy", "show", "-g", rg, "-s", svr, "-n", db_name])
+                    f_show = ex.submit(self._az, ["sql", "db", "show", "-g", rg, "-s", svr, "-n", db_name])
+                    f_tde  = ex.submit(self._az, ["sql", "db", "tde", "show", "-g", rg, "-s", svr, "-n", db_name])
+                    f_ltr  = ex.submit(self._az, ["sql", "db", "ltr-policy", "show", "-g", rg, "-s", svr, "-n", db_name])
+                    f_str  = ex.submit(self._az, ["sql", "db", "str-policy", "show", "-g", rg, "-s", svr, "-n", db_name])
 
                 db_show = f_show.result()
                 tde     = f_tde.result()
@@ -575,16 +599,16 @@ class AzureInventoryCollector:
 
     # ── Prompt 7: Storage + Key Vault collectors ──────────────────────────────
     def collect_storage(self, rg):
-        accounts = run_az(["storage", "account", "list", "--resource-group", rg]) or []
+        accounts = self._az(["storage", "account", "list", "--resource-group", rg]) or []
         result = []
         for a in accounts:
             name = a.get("name", "")
             futures = {}
             with ThreadPoolExecutor(max_workers=3) as ex:
-                futures["show"]       = ex.submit(run_az, ["storage", "account", "show", "-n", name, "-g", rg])
-                futures["blob_svc"]   = ex.submit(run_az, ["storage", "account", "blob-service-properties", "show", "--account-name", name])
-                futures["containers"] = ex.submit(run_az, ["storage", "container", "list", "--account-name", name, "--auth-mode", "login", "--num-results", "100"])
-                futures["shares"]     = ex.submit(run_az, ["storage", "share-rm", "list", "-g", rg, "--storage-account", name])
+                futures["show"]       = ex.submit(self._az, ["storage", "account", "show", "-n", name, "-g", rg])
+                futures["blob_svc"]   = ex.submit(self._az, ["storage", "account", "blob-service-properties", "show", "--account-name", name])
+                futures["containers"] = ex.submit(self._az, ["storage", "container", "list", "--account-name", name, "--auth-mode", "login", "--num-results", "100"])
+                futures["shares"]     = ex.submit(self._az, ["storage", "share-rm", "list", "-g", rg, "--storage-account", name])
 
             show       = futures["show"].result()
             blob_svc   = futures["blob_svc"].result()
@@ -631,16 +655,16 @@ class AzureInventoryCollector:
         return {"storage_accounts": result}
 
     def collect_key_vaults(self, rg):
-        vaults = run_az(["keyvault", "list", "--resource-group", rg]) or []
+        vaults = self._az(["keyvault", "list", "--resource-group", rg]) or []
         result = []
         for v in vaults:
             name = v.get("name", "")
             futures = {}
             with ThreadPoolExecutor(max_workers=3) as ex:
-                futures["show"]    = ex.submit(run_az, ["keyvault", "show", "-n", name, "-g", rg])
-                futures["secrets"] = ex.submit(run_az, ["keyvault", "secret", "list", "--vault-name", name])
-                futures["keys"]    = ex.submit(run_az, ["keyvault", "key", "list", "--vault-name", name])
-                futures["certs"]   = ex.submit(run_az, ["keyvault", "certificate", "list", "--vault-name", name])
+                futures["show"]    = ex.submit(self._az, ["keyvault", "show", "-n", name, "-g", rg])
+                futures["secrets"] = ex.submit(self._az, ["keyvault", "secret", "list", "--vault-name", name])
+                futures["keys"]    = ex.submit(self._az, ["keyvault", "key", "list", "--vault-name", name])
+                futures["certs"]   = ex.submit(self._az, ["keyvault", "certificate", "list", "--vault-name", name])
 
             show    = futures["show"].result()
             secrets = futures["secrets"].result() or []
@@ -694,8 +718,8 @@ class AzureInventoryCollector:
     def collect_networking(self, rg):
         def _vnets():
             result = []
-            for v in (run_az(["network", "vnet", "list", "-g", rg]) or []):
-                show = run_az(["network", "vnet", "show", "-n", v["name"], "-g", rg]) or v
+            for v in (self._az(["network", "vnet", "list", "-g", rg]) or []):
+                show = self._az(["network", "vnet", "show", "-n", v["name"], "-g", rg]) or v
                 result.append({
                     "id": show.get("id"), "name": show.get("name"),
                     "location": show.get("location"), "resourceGroup": rg,
@@ -724,8 +748,8 @@ class AzureInventoryCollector:
 
         def _nsgs():
             result = []
-            for n in (run_az(["network", "nsg", "list", "-g", rg]) or []):
-                show = run_az(["network", "nsg", "show", "-n", n["name"], "-g", rg]) or n
+            for n in (self._az(["network", "nsg", "list", "-g", rg]) or []):
+                show = self._az(["network", "nsg", "show", "-n", n["name"], "-g", rg]) or n
                 def _rules(key):
                     return [{"name": r["name"], "priority": r.get("priority"),
                              "direction": r.get("direction"), "access": r.get("access"),
@@ -745,8 +769,8 @@ class AzureInventoryCollector:
 
         def _routes():
             result = []
-            for t in (run_az(["network", "route-table", "list", "-g", rg]) or []):
-                show = run_az(["network", "route-table", "show", "-n", t["name"], "-g", rg]) or t
+            for t in (self._az(["network", "route-table", "list", "-g", rg]) or []):
+                show = self._az(["network", "route-table", "show", "-n", t["name"], "-g", rg]) or t
                 result.append({
                     "id": show.get("id"), "name": show.get("name"),
                     "location": show.get("location"), "resourceGroup": rg,
@@ -760,8 +784,8 @@ class AzureInventoryCollector:
 
         def _public_ips():
             result = []
-            for p in (run_az(["network", "public-ip", "list", "-g", rg]) or []):
-                show = run_az(["network", "public-ip", "show", "-n", p["name"], "-g", rg]) or p
+            for p in (self._az(["network", "public-ip", "list", "-g", rg]) or []):
+                show = self._az(["network", "public-ip", "show", "-n", p["name"], "-g", rg]) or p
                 result.append({
                     "id": show.get("id"), "name": show.get("name"),
                     "location": show.get("location"), "resourceGroup": rg,
@@ -776,8 +800,8 @@ class AzureInventoryCollector:
 
         def _private_endpoints():
             result = []
-            for pe in (run_az(["network", "private-endpoint", "list", "-g", rg]) or []):
-                show = run_az(["network", "private-endpoint", "show", "-n", pe["name"], "-g", rg]) or pe
+            for pe in (self._az(["network", "private-endpoint", "list", "-g", rg]) or []):
+                show = self._az(["network", "private-endpoint", "show", "-n", pe["name"], "-g", rg]) or pe
                 result.append({
                     "id": show.get("id"), "name": show.get("name"),
                     "location": show.get("location"), "resourceGroup": rg,
@@ -798,10 +822,10 @@ class AzureInventoryCollector:
 
         def _private_dns():
             result = []
-            for zone in (run_az(["network", "private-dns", "zone", "list", "-g", rg]) or []):
+            for zone in (self._az(["network", "private-dns", "zone", "list", "-g", rg]) or []):
                 zone_name = zone.get("name", "")
-                show  = run_az(["network", "private-dns", "zone", "show", "-n", zone_name, "-g", rg]) or zone
-                links = run_az(["network", "private-dns", "link", "vnet", "list", "-g", rg, "-z", zone_name]) or []
+                show  = self._az(["network", "private-dns", "zone", "show", "-n", zone_name, "-g", rg]) or zone
+                links = self._az(["network", "private-dns", "link", "vnet", "list", "-g", rg, "-z", zone_name]) or []
                 result.append({
                     "id": show.get("id"), "name": zone_name,
                     "location": show.get("location"), "resourceGroup": rg,
@@ -826,11 +850,11 @@ class AzureInventoryCollector:
         return merged
 
     def collect_app_gateways(self, rg):
-        agws = run_az(["network", "application-gateway", "list", "-g", rg]) or []
+        agws = self._az(["network", "application-gateway", "list", "-g", rg]) or []
         agw_list = []
         for agw in agws:
             name = agw.get("name", "")
-            show = run_az(["network", "application-gateway", "show", "-n", name, "-g", rg]) or agw
+            show = self._az(["network", "application-gateway", "show", "-n", name, "-g", rg]) or agw
             gw_subnet_raw = safe_get(show, "gatewayIPConfigurations", default=[{}])
             gw_subnet = parse_vnet_subnet(safe_get(gw_subnet_raw[0], "subnet", "id") or "") if gw_subnet_raw else {}
             agw_list.append({
@@ -879,9 +903,9 @@ class AzureInventoryCollector:
             self.tracker.log_success(f"AppGateway: {name} ({rg})")
 
         waf_policies = []
-        for pol in (run_az(["network", "application-gateway", "waf-policy", "list", "-g", rg]) or []):
+        for pol in (self._az(["network", "application-gateway", "waf-policy", "list", "-g", rg]) or []):
             pname = pol.get("name", "")
-            show = run_az(["network", "application-gateway", "waf-policy", "show", "-n", pname, "-g", rg]) or pol
+            show = self._az(["network", "application-gateway", "waf-policy", "show", "-n", pname, "-g", rg]) or pol
             waf_policies.append({
                 "id": show.get("id"), "name": pname,
                 "location": show.get("location"), "resourceGroup": rg,
@@ -897,11 +921,11 @@ class AzureInventoryCollector:
 
     # ── Prompt 9: LB + TM + Identities + Monitoring + Other ──────────────────
     def collect_load_balancers(self, rg):
-        lbs = run_az(["network", "lb", "list", "-g", rg]) or []
+        lbs = self._az(["network", "lb", "list", "-g", rg]) or []
         result = []
         for lb in lbs:
             name = lb.get("name", "")
-            show = run_az(["network", "lb", "show", "-n", name, "-g", rg]) or lb
+            show = self._az(["network", "lb", "show", "-n", name, "-g", rg]) or lb
             result.append({
                 "id": show.get("id"), "name": name,
                 "location": show.get("location"), "resourceGroup": rg,
@@ -932,11 +956,11 @@ class AzureInventoryCollector:
         return {"load_balancers": result}
 
     def collect_traffic_managers(self, rg):
-        profiles = run_az(["network", "traffic-manager", "profile", "list", "-g", rg]) or []
+        profiles = self._az(["network", "traffic-manager", "profile", "list", "-g", rg]) or []
         result = []
         for profile in profiles:
             name = profile.get("name", "")
-            show = run_az(["network", "traffic-manager", "profile", "show", "-n", name, "-g", rg]) or profile
+            show = self._az(["network", "traffic-manager", "profile", "show", "-n", name, "-g", rg]) or profile
             result.append({
                 "id": show.get("id"), "name": name,
                 "resourceGroup": rg, "location": show.get("location"),
@@ -962,14 +986,14 @@ class AzureInventoryCollector:
         return {"traffic_managers": result}
 
     def collect_managed_identities(self, rg):
-        ids = run_az(["identity", "list", "-g", rg]) or []
+        ids = self._az(["identity", "list", "-g", rg]) or []
         result = []
         for identity in ids:
             name = identity.get("name", "")
-            show = run_az(["identity", "show", "-n", name, "-g", rg]) or identity
+            show = self._az(["identity", "show", "-n", name, "-g", rg]) or identity
             pid = safe_get(show, "principalId")
             try:
-                ra = run_az(["role", "assignment", "list", "--assignee", pid, "--all-namespaces"]) or [] if pid else []
+                ra = self._az(["role", "assignment", "list", "--assignee", pid, "--all-namespaces"]) or [] if pid else []
             except Exception:
                 ra = []
             result.append({
@@ -989,9 +1013,9 @@ class AzureInventoryCollector:
     def collect_monitoring(self, rg):
         def _log_analytics():
             result = []
-            for ws in (run_az(["monitor", "log-analytics", "workspace", "list", "-g", rg]) or []):
+            for ws in (self._az(["monitor", "log-analytics", "workspace", "list", "-g", rg]) or []):
                 name = ws.get("name", "")
-                show = run_az(["monitor", "log-analytics", "workspace", "show", "-n", name, "-g", rg]) or ws
+                show = self._az(["monitor", "log-analytics", "workspace", "show", "-n", name, "-g", rg]) or ws
                 result.append({
                     "id": show.get("id"), "name": name,
                     "location": show.get("location"), "resourceGroup": rg,
@@ -1006,9 +1030,9 @@ class AzureInventoryCollector:
 
         def _app_insights():
             result = []
-            for ai in (run_az(["monitor", "app-insights", "component", "list", "-g", rg]) or []):
+            for ai in (self._az(["monitor", "app-insights", "component", "list", "-g", rg]) or []):
                 name = ai.get("name", "")
-                show = run_az(["monitor", "app-insights", "component", "show", "-n", name, "-g", rg]) or ai
+                show = self._az(["monitor", "app-insights", "component", "show", "-n", name, "-g", rg]) or ai
                 result.append({
                     "id": show.get("id"), "name": name,
                     "location": show.get("location"), "resourceGroup": rg,
@@ -1020,31 +1044,209 @@ class AzureInventoryCollector:
                     "workspace_name": parse_resource_name(safe_get(show, "workspaceResourceId") or ""),
                     "ingestion_mode": safe_get(show, "ingestionMode"),
                     "disable_local_auth": safe_get(show, "disableLocalAuth"),
+                    "connection_string": safe_get(show, "connectionString"),
+                    "instrumentation_key": safe_get(show, "instrumentationKey"),
+                    "sampling_percentage": safe_get(show, "samplingPercentage"),
+                    "flow_type": safe_get(show, "flowType"),
                 })
             return {"app_insights": result}
 
-        def _alerts():
-            alerts = run_az(["monitor", "metrics", "alert", "list", "-g", rg]) or []
-            return {"alert_rules": [{"name": a["name"], "severity": safe_get(a, "severity"),
-                                     "enabled": safe_get(a, "enabled")} for a in alerts]}
+        def _metric_alerts():
+            alerts = self._az(["monitor", "metrics", "alert", "list", "-g", rg]) or []
+            result = []
+            for a in alerts:
+                result.append({
+                    "name": a.get("name"), "id": a.get("id"),
+                    "location": a.get("location"), "resourceGroup": rg,
+                    "tags": a.get("tags") or {},
+                    "severity": safe_get(a, "severity"),
+                    "enabled": safe_get(a, "enabled"),
+                    "description": safe_get(a, "description"),
+                    "evaluation_frequency": safe_get(a, "evaluationFrequency"),
+                    "window_size": safe_get(a, "windowSize"),
+                    "scopes": safe_get(a, "scopes") or [],
+                    "alert_type": "metric",
+                })
+            return {"alert_rules": result}
 
         def _action_groups():
-            ags = run_az(["monitor", "action-group", "list", "-g", rg]) or []
-            return {"_action_groups_temp": [{"name": ag["name"],
-                                             "email_count": len(safe_get(ag, "emailReceivers", default=[])),
-                                             "webhook_count": len(safe_get(ag, "webhookReceivers", default=[]))}
-                                            for ag in ags]}
+            ags = self._az(["monitor", "action-group", "list", "-g", rg]) or []
+            result = []
+            for ag in ags:
+                name = ag.get("name", "")
+                show = self._az(["monitor", "action-group", "show", "-n", name, "-g", rg]) or ag
+                result.append({
+                    "id": show.get("id"), "name": name,
+                    "location": show.get("location"), "resourceGroup": rg,
+                    "tags": show.get("tags") or {},
+                    "short_name": safe_get(show, "groupShortName"),
+                    "enabled": safe_get(show, "enabled"),
+                    "email_count": len(safe_get(show, "emailReceivers", default=[])),
+                    "sms_count": len(safe_get(show, "smsReceivers", default=[])),
+                    "webhook_count": len(safe_get(show, "webhookReceivers", default=[])),
+                    "logic_app_count": len(safe_get(show, "logicAppReceivers", default=[])),
+                    "azure_function_count": len(safe_get(show, "azureFunctionReceivers", default=[])),
+                    "arm_role_count": len(safe_get(show, "armRoleReceivers", default=[])),
+                    "email_receivers": [{"name": r.get("name"), "address": r.get("emailAddress")}
+                                        for r in (safe_get(show, "emailReceivers") or [])],
+                })
+            return {"action_groups": result}
+
+        def _activity_log_alerts():
+            alerts = self._az(["monitor", "activity-log", "alert", "list", "-g", rg]) or []
+            result = []
+            for a in alerts:
+                name = a.get("name", "")
+                show = self._az(["monitor", "activity-log", "alert", "show", "-n", name, "-g", rg]) or a
+                result.append({
+                    "id": show.get("id"), "name": name,
+                    "location": show.get("location"), "resourceGroup": rg,
+                    "tags": show.get("tags") or {},
+                    "enabled": safe_get(show, "enabled"),
+                    "description": safe_get(show, "description"),
+                    "scopes": safe_get(show, "scopes") or [],
+                    "conditions": [
+                        {"field": c.get("field"), "equals": c.get("equals")}
+                        for c in (safe_get(show, "condition", "allOf") or [])
+                    ],
+                    "action_group_ids": [
+                        ag.get("actionGroupId")
+                        for ag in (safe_get(show, "actions", "actionGroups") or [])
+                    ],
+                    "alert_type": "activity_log",
+                })
+            return {"activity_log_alerts": result}
+
+        def _scheduled_query_alerts():
+            rules = self._az(["monitor", "scheduled-query", "list", "-g", rg]) or []
+            result = []
+            for r in rules:
+                name = r.get("name", "")
+                show = self._az(["monitor", "scheduled-query", "show", "-n", name, "-g", rg]) or r
+                result.append({
+                    "id": show.get("id"), "name": name,
+                    "location": show.get("location"), "resourceGroup": rg,
+                    "tags": show.get("tags") or {},
+                    "severity": safe_get(show, "severity"),
+                    "enabled": safe_get(show, "enabled"),
+                    "description": safe_get(show, "description"),
+                    "evaluation_frequency": safe_get(show, "evaluationFrequency"),
+                    "window_duration": safe_get(show, "windowDuration"),
+                    "scopes": safe_get(show, "scopes") or [],
+                    "criteria_queries": [
+                        {"query": c.get("query", "")[:200], "operator": c.get("operator"),
+                         "threshold": c.get("threshold")}
+                        for c in (safe_get(show, "criteria", "allOf") or [])
+                    ],
+                    "alert_type": "scheduled_query",
+                })
+            return {"scheduled_query_alerts": result}
+
+        def _smart_detector_alerts():
+            # Smart Detector Alert Rules live under microsoft.alertsmanagement/smartDetectorAlertRules
+            alerts = self._az([
+                "rest", "--method", "get",
+                "--url", f"https://management.azure.com/subscriptions/{{sub}}/resourceGroups/{rg}"
+                         f"/providers/microsoft.alertsmanagement/smartDetectorAlertRules"
+                         f"?api-version=2021-04-01",
+            ]) or {}
+            items = alerts.get("value", []) if isinstance(alerts, dict) else []
+            result = []
+            for a in items:
+                props = a.get("properties", {})
+                result.append({
+                    "id": a.get("id"), "name": a.get("name"),
+                    "location": a.get("location"), "resourceGroup": rg,
+                    "tags": a.get("tags") or {},
+                    "severity": props.get("severity"),
+                    "enabled": props.get("state", "").lower() == "enabled",
+                    "description": props.get("description"),
+                    "frequency": props.get("frequency"),
+                    "scope": props.get("scope", []),
+                    "detector_id": safe_get(props, "detector", "id"),
+                    "action_group_ids": [
+                        ag.get("actionGroupId")
+                        for ag in (safe_get(props, "actionGroups", "groupIds") or [])
+                    ],
+                    "alert_type": "smart_detector",
+                })
+            return {"smart_detector_alert_rules": result}
 
         merged = {}
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            futs = [ex.submit(fn) for fn in [_log_analytics, _app_insights, _alerts, _action_groups]]
+        fns = [_log_analytics, _app_insights, _metric_alerts, _action_groups,
+               _activity_log_alerts, _scheduled_query_alerts, _smart_detector_alerts]
+        with ThreadPoolExecutor(max_workers=7) as ex:
+            futs = [ex.submit(fn) for fn in fns]
         for fut in as_completed(futs):
             try:
                 merged.update(fut.result())
             except Exception as e:
                 self.tracker.log_warning(f"Monitoring in {rg}: {e}")
-        merged.pop("_action_groups_temp", None)
         merged["diagnostic_settings"] = []
+        return merged
+
+    def collect_event_grid(self, rg):
+        def _topics():
+            topics = self._az(["eventgrid", "topic", "list", "-g", rg]) or []
+            result = []
+            for t in topics:
+                name = t.get("name", "")
+                show = self._az(["eventgrid", "topic", "show", "-n", name, "-g", rg]) or t
+                # fetch event subscriptions for each topic
+                subs = self._az([
+                    "eventgrid", "event-subscription", "list",
+                    "--source-resource-id", show.get("id", ""),
+                ]) or [] if show.get("id") else []
+                result.append({
+                    "id": show.get("id"), "name": name,
+                    "location": show.get("location"), "resourceGroup": rg,
+                    "tags": show.get("tags") or {},
+                    "endpoint": safe_get(show, "endpoint"),
+                    "input_schema": safe_get(show, "inputSchema"),
+                    "public_network_access": safe_get(show, "publicNetworkAccess"),
+                    "provisioning_state": safe_get(show, "provisioningState"),
+                    "event_subscriptions": [
+                        {"name": s.get("name"),
+                         "endpoint_type": safe_get(s, "properties", "destination", "endpointType"),
+                         "endpoint_url": safe_get(s, "properties", "destination", "properties", "endpointUrl"),
+                         "event_types": safe_get(s, "properties", "filter", "includedEventTypes") or []}
+                        for s in subs
+                    ],
+                })
+                self.tracker.log_success(f"EventGridTopic: {name} ({rg})")
+            return {"event_grid_topics": result}
+
+        def _domains():
+            domains = self._az(["eventgrid", "domain", "list", "-g", rg]) or []
+            result = []
+            for d in domains:
+                name = d.get("name", "")
+                show = self._az(["eventgrid", "domain", "show", "-n", name, "-g", rg]) or d
+                dom_topics = self._az([
+                    "eventgrid", "domain", "topic", "list", "-g", rg, "--domain-name", name,
+                ]) or []
+                result.append({
+                    "id": show.get("id"), "name": name,
+                    "location": show.get("location"), "resourceGroup": rg,
+                    "tags": show.get("tags") or {},
+                    "endpoint": safe_get(show, "endpoint"),
+                    "input_schema": safe_get(show, "inputSchema"),
+                    "public_network_access": safe_get(show, "publicNetworkAccess"),
+                    "provisioning_state": safe_get(show, "provisioningState"),
+                    "domain_topics": [{"name": dt.get("name")} for dt in dom_topics],
+                    "domain_topics_count": len(dom_topics),
+                })
+                self.tracker.log_success(f"EventGridDomain: {name} ({rg})")
+            return {"event_grid_domains": result}
+
+        merged = {}
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futs = [ex.submit(_topics), ex.submit(_domains)]
+        for fut in as_completed(futs):
+            try:
+                merged.update(fut.result())
+            except Exception as e:
+                self.tracker.log_warning(f"EventGrid in {rg}: {e}")
         return merged
 
     def collect_other_resources(self, rg):
@@ -1055,15 +1257,23 @@ class AzureInventoryCollector:
             "microsoft.insights/components",
             "microsoft.operationalinsights/workspaces",
             "microsoft.managedidentity/userassignedidentities",
+            "microsoft.eventgrid/topics",
+            "microsoft.eventgrid/domains",
+            "microsoft.eventgrid/domains/topics",
+            "microsoft.alertsmanagement/smartdetectoralertrules",
+            "microsoft.insights/metricalerts",
+            "microsoft.insights/scheduledqueryrules",
+            "microsoft.insights/activitylogalerts",
+            "microsoft.insights/actiongroups",
         }
-        all_res = run_az(["resource", "list", "-g", rg]) or []
+        all_res = self._az(["resource", "list", "-g", rg]) or []
         others = [r for r in all_res
                   if r.get("type", "").lower() not in SKIP_TYPES
                   and not r.get("type", "").lower().startswith("microsoft.network/")]
         result = []
         for r in others:
             try:
-                details = run_az(["resource", "show", "--ids", r["id"]])
+                details = self._az(["resource", "show", "--ids", r["id"]])
             except Exception:
                 details = None
             result.append({
@@ -1574,9 +1784,12 @@ class HTMLReportGenerator:
         return """<style>
 *{box-sizing:border-box}
 body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f5f5f5;color:#333}
-nav{position:sticky;top:0;background:#0078D4;padding:8px 16px;z-index:100;display:flex;gap:12px;flex-wrap:wrap}
+nav{position:sticky;top:0;background:#0078D4;padding:8px 16px;z-index:100;display:flex;gap:12px;flex-wrap:wrap;align-items:center}
 nav a{color:white;text-decoration:none;font-size:13px;padding:4px 8px;border-radius:4px}
 nav a:hover{background:rgba(255,255,255,.2)}
+#global-search{padding:5px 10px;border:none;border-radius:4px;font-size:13px;width:240px;margin-left:auto;outline:none}
+#global-search:focus{box-shadow:0 0 0 2px rgba(255,255,255,.5)}
+#search-count{color:rgba(255,255,255,.85);font-size:12px;min-width:80px}
 .page{max-width:1400px;margin:0 auto;padding:16px}
 h1{color:#0078D4}
 h2{background:#0078D4;color:white;padding:10px 16px;border-radius:6px}
@@ -1620,6 +1833,32 @@ function filterTable(inputId,tableId){
   document.querySelectorAll('#'+tableId+' tbody tr').forEach(function(tr){
     tr.style.display=tr.innerText.toLowerCase().includes(v)?'':'none';
   });
+}
+function globalSearch(val){
+  var v=(val||'').toLowerCase().trim();
+  var countEl=document.getElementById('search-count');
+  if(!v){
+    // restore everything
+    document.querySelectorAll('table tbody tr').forEach(function(tr){tr.style.display='';});
+    document.querySelectorAll('details').forEach(function(d){d.style.display='';});
+    document.querySelectorAll('.card,.rg-header').forEach(function(el){el.style.display='';});
+    if(countEl) countEl.textContent='';
+    return;
+  }
+  var found=0;
+  // search every table row on the page
+  document.querySelectorAll('table tbody tr').forEach(function(tr){
+    var match=tr.innerText.toLowerCase().includes(v);
+    tr.style.display=match?'':'none';
+    if(match) found++;
+  });
+  // show/hide parent <details> based on whether any child rows are visible
+  document.querySelectorAll('details').forEach(function(d){
+    var visible=Array.from(d.querySelectorAll('tbody tr')).some(function(tr){return tr.style.display!=='none';});
+    d.style.display=visible?'':'none';
+    if(visible) d.open=true;
+  });
+  if(countEl) countEl.textContent=found+' row'+(found===1?'':'s');
 }
 function sortTable(th){
   var table=th.closest('table'),tbody=table.querySelector('tbody');
@@ -1678,7 +1917,12 @@ document.addEventListener('DOMContentLoaded',function(){
             ("#risks","Risk Register"), ("#migration-order","Migration Order"),
             ("#checklist","Checklist"),
         ]
-        nav = '<nav>' + ''.join(f'<a href="{h}">{t}</a>' for h, t in nav_links) + '</nav>'
+        nav = ('<nav>'
+               + ''.join(f'<a href="{h}">{t}</a>' for h, t in nav_links)
+               + '<input id="global-search" type="search" placeholder="&#128269; Search all resources..." '
+               + 'oninput="globalSearch(this.value)" autocomplete="off">'
+               + '<span id="search-count"></span>'
+               + '</nav>')
         parts = [
             "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>",
             "<meta name='viewport' content='width=device-width,initial-scale=1'>",
@@ -2312,28 +2556,139 @@ class GitRepoScanner:
         return repo_to_apps
 
 
+def resolve_subscriptions(args, tracker):
+    """Resolve and validate subscriptions from config.json.
+
+    Reads subscription_ids and subscription_names from args (loaded from config.json).
+    Exits with a clear error if neither field is populated – the script will NOT fall
+    back to scanning all subscriptions; an explicit list is required.
+
+    Returns a list of {"id": ..., "name": ...} dicts for every matched subscription.
+    """
+    sub_ids_cfg   = list(getattr(args, "subscription_ids",   []))
+    sub_names_cfg = list(getattr(args, "subscription_names", []))
+    names_lower   = [n.lower() for n in sub_names_cfg]
+
+    if not sub_ids_cfg and not sub_names_cfg:
+        print("")
+        print("  " + "!" * 70)
+        print("  !! ERROR: No subscriptions mentioned in config.json.")
+        print("  !!")
+        print("  !! The script requires at least one of these fields in config.json:")
+        print("  !!   \"subscription_ids\":   [\"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\"]")
+        print("  !!   \"subscription_names\": [\"My Production Subscription\"]")
+        print("  !!")
+        print("  !! Names are case-insensitive and support partial matching.")
+        print("  !! Or pass --subscription-id <GUID> on the command line.")
+        print("  " + "!" * 70)
+        print("")
+        sys.exit(1)
+
+    all_subs = run_az(["account", "list"]) or []
+    if not all_subs:
+        tracker.log_error("Could not list Azure subscriptions. Ensure 'az login' is valid.")
+        sys.exit(1)
+
+    matched  = []
+    seen_ids = set()
+    for sub in all_subs:
+        sub_id   = sub.get("id") or sub.get("subscriptionId", "")
+        sub_name = sub.get("name", "")
+        if sub.get("state", "Enabled") != "Enabled":
+            continue
+        by_id   = sub_id in sub_ids_cfg
+        by_name = any(n in sub_name.lower() for n in names_lower)
+        if (by_id or by_name) and sub_id not in seen_ids:
+            matched.append({"id": sub_id, "name": sub_name})
+            seen_ids.add(sub_id)
+
+    if not matched:
+        tracker.log_error("No matching subscriptions found!")
+        tracker.log_warning(f"  Requested IDs  : {sub_ids_cfg}")
+        tracker.log_warning(f"  Requested names: {sub_names_cfg}")
+        tracker.log_warning("  Available enabled subscriptions:")
+        for s in [s for s in all_subs if s.get("state") == "Enabled"][:10]:
+            sid = s.get("id") or s.get("subscriptionId", "")
+            tracker.log_warning(f"    - {s.get('name')} ({sid})")
+        tracker.log_warning("  Update subscription_ids or subscription_names in config.json.")
+        sys.exit(1)
+
+    tracker.log_info(f"Subscriptions to scan ({len(matched)}):")
+    for s in matched:
+        tracker.log_info(f"  • {s['name']} ({s['id']})")
+    return matched
+
+
 def collect_inventory(args, tracker):
     tracker.start_phase("Azure Resource Collection")
-    c = AzureInventoryCollector(args, tracker)
-    inventory = c.collect_all()
+
+    target_subs = resolve_subscriptions(args, tracker)
+    multi_sub   = len(target_subs) > 1
+
+    # Combined inventory that merges RGs from all subscriptions.
+    # "subscription"  kept for backwards-compat with single-sub downstream code.
+    # "subscriptions" carries the full list for multi-sub reporting.
+    combined = {
+        "_output_dir":   str(args.output_dir),
+        "subscription":  target_subs[0],
+        "subscriptions": target_subs,
+        "resource_groups": {},
+    }
+    _lock = threading.Lock()
+
+    def _scan_sub(sub_info):
+        sub_id, sub_name = sub_info["id"], sub_info["name"]
+        tracker.log_info(f"Scanning subscription: {sub_name} ({sub_id})")
+        c   = AzureInventoryCollector(args, tracker, subscription_id=sub_id)
+        inv = c.collect_all()
+        rgs = inv.get("resource_groups", {})
+        # Prefix RG keys with "[SubName] " when scanning multiple subscriptions
+        # to prevent key name collisions in the merged inventory.
+        prefix = f"[{sub_name}] " if multi_sub else ""
+        with _lock:
+            for rg_key, rg_data in rgs.items():
+                merged_key = f"{prefix}{rg_key}" if prefix else rg_key
+                combined["resource_groups"][merged_key] = rg_data
+
+    # Run subscription scans in parallel – each collector independently passes
+    # --subscription to every az CLI call so there is no shared CLI context.
+    max_workers = min(len(target_subs), getattr(args, "parallel_workers", 4))
+    if max_workers > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(_scan_sub, s): s for s in target_subs}
+            for fut in as_completed(futs):
+                s = futs[fut]
+                try:
+                    fut.result()
+                    tracker.log_success(f"Subscription complete: {s['name']}")
+                except Exception as e:
+                    tracker.log_error(f"Subscription failed – {s['name']}: {e}")
+    else:
+        _scan_sub(target_subs[0])
+
+    # Persist the merged raw inventory
+    out = Path(args.output_dir)
+    (out / "raw-data" / "inventory-by-resource-group.json").write_text(
+        json.dumps(combined, indent=2), encoding="utf-8"
+    )
 
     # ── optional Git/DevOps code scanning ─────────────────────────────────────
     if getattr(args, "scan_code", False):
         scanner = GitRepoScanner(args, tracker)
         git_results = scanner.scan_all()
         repo_to_apps = GitRepoScanner.cross_reference(
-            git_results["findings"], inventory)
-        inventory["git_findings"]     = git_results["findings"]
-        inventory["git_repo_summaries"] = git_results["repo_summaries"]
-        inventory["git_repo_to_apps"]   = repo_to_apps
+            git_results["findings"], combined)
+        combined["git_findings"]       = git_results["findings"]
+        combined["git_repo_summaries"] = git_results["repo_summaries"]
+        combined["git_repo_to_apps"]   = repo_to_apps
 
-        out = Path(inventory.get("_output_dir", "./migration-output"))
-        (out / "raw-data" / "git-code-scan-findings.json").write_text(
+        out2 = Path(combined.get("_output_dir", "./migration-output"))
+        (out2 / "raw-data" / "git-code-scan-findings.json").write_text(
             json.dumps(git_results["findings"], indent=2), encoding="utf-8")
-        (out / "raw-data" / "git-repo-summaries.json").write_text(
+        (out2 / "raw-data" / "git-repo-summaries.json").write_text(
             json.dumps(git_results["repo_summaries"], indent=2), encoding="utf-8")
         if git_results["findings"]:
-            with open(out / "raw-data" / "git-findings.csv", "w",
+            with open(out2 / "raw-data" / "git-findings.csv", "w",
                       newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=[
                     "finding_id", "repo_name", "project", "file_path",
@@ -2343,11 +2698,11 @@ def collect_inventory(args, tracker):
                 w.writeheader()
                 w.writerows(git_results["findings"])
     else:
-        inventory["git_findings"]       = []
-        inventory["git_repo_summaries"] = []
-        inventory["git_repo_to_apps"]   = {}
+        combined["git_findings"]       = []
+        combined["git_repo_summaries"] = []
+        combined["git_repo_to_apps"]   = {}
 
-    return inventory
+    return combined
 
 def build_dependency_map(inventory, tracker):
     tracker.start_phase("Building Dependency Map", 4)
@@ -2793,17 +3148,73 @@ class ExcelReportGenerator:
 
         ws.append([])
         ws.append(["── Application Insights ──"])
-        ws.append(["RG", "Name", "Location", "Kind", "App Type", "Retention", "Workspace", "Ingestion Mode", "Disable Local Auth"])
+        ws.append(["RG", "Name", "Location", "Kind", "App Type", "Retention", "Workspace",
+                   "Ingestion Mode", "Disable Local Auth", "Sampling %", "Flow Type"])
         for rg_name, ai in self._all_resources_flat("app_insights"):
             self._wr(ws, [rg_name, ai.get("name"), ai.get("location"), ai.get("kind"),
                 ai.get("application_type"), ai.get("retention_days"),
-                ai.get("workspace_name"), ai.get("ingestion_mode"), ai.get("disable_local_auth")])
+                ai.get("workspace_name"), ai.get("ingestion_mode"),
+                ai.get("disable_local_auth"), ai.get("sampling_percentage"), ai.get("flow_type")])
 
         ws.append([])
-        ws.append(["── Alert Rules ──"])
-        ws.append(["RG", "Name", "Severity", "Enabled"])
+        ws.append(["── Action Groups ──"])
+        ws.append(["RG", "Name", "Location", "Short Name", "Enabled",
+                   "Email Count", "SMS Count", "Webhook Count", "Logic App Count", "Azure Function Count", "ARM Role Count"])
+        for rg_name, ag in self._all_resources_flat("action_groups"):
+            self._wr(ws, [rg_name, ag.get("name"), ag.get("location"), ag.get("short_name"),
+                ag.get("enabled"), ag.get("email_count"), ag.get("sms_count"),
+                ag.get("webhook_count"), ag.get("logic_app_count"),
+                ag.get("azure_function_count"), ag.get("arm_role_count")])
+
+        ws.append([])
+        ws.append(["── Metric Alert Rules ──"])
+        ws.append(["RG", "Name", "Severity", "Enabled", "Description", "Evaluation Frequency", "Window Size", "Scopes"])
         for rg_name, a in self._all_resources_flat("alert_rules"):
-            self._wr(ws, [rg_name, a.get("name"), a.get("severity"), a.get("enabled")])
+            self._wr(ws, [rg_name, a.get("name"), a.get("severity"), a.get("enabled"),
+                a.get("description"), a.get("evaluation_frequency"), a.get("window_size"),
+                "; ".join(a.get("scopes") or [])])
+
+        ws.append([])
+        ws.append(["── Activity Log Alerts ──"])
+        ws.append(["RG", "Name", "Enabled", "Description", "Scopes", "Conditions", "Action Groups"])
+        for rg_name, a in self._all_resources_flat("activity_log_alerts"):
+            conds = "; ".join(f"{c.get('field')}={c.get('equals')}" for c in (a.get("conditions") or []))
+            self._wr(ws, [rg_name, a.get("name"), a.get("enabled"), a.get("description"),
+                "; ".join(a.get("scopes") or []), conds,
+                "; ".join(filter(None, a.get("action_group_ids") or []))])
+
+        ws.append([])
+        ws.append(["── Scheduled Query (Log Search) Alerts ──"])
+        ws.append(["RG", "Name", "Severity", "Enabled", "Description", "Evaluation Frequency", "Window Duration", "Scopes"])
+        for rg_name, a in self._all_resources_flat("scheduled_query_alerts"):
+            self._wr(ws, [rg_name, a.get("name"), a.get("severity"), a.get("enabled"),
+                a.get("description"), a.get("evaluation_frequency"), a.get("window_duration"),
+                "; ".join(a.get("scopes") or [])])
+
+        ws.append([])
+        ws.append(["── Smart Detector Alert Rules ──"])
+        ws.append(["RG", "Name", "Severity", "Enabled", "Description", "Frequency", "Detector ID"])
+        for rg_name, a in self._all_resources_flat("smart_detector_alert_rules"):
+            self._wr(ws, [rg_name, a.get("name"), a.get("severity"), a.get("enabled"),
+                a.get("description"), a.get("frequency"), a.get("detector_id")])
+
+        ws.append([])
+        ws.append(["── Event Grid Topics ──"])
+        ws.append(["RG", "Name", "Location", "Input Schema", "Endpoint", "Public Network Access",
+                   "Provisioning State", "Event Subscriptions Count"])
+        for rg_name, t in self._all_resources_flat("event_grid_topics"):
+            self._wr(ws, [rg_name, t.get("name"), t.get("location"), t.get("input_schema"),
+                t.get("endpoint"), t.get("public_network_access"), t.get("provisioning_state"),
+                len(t.get("event_subscriptions") or [])])
+
+        ws.append([])
+        ws.append(["── Event Grid Domains ──"])
+        ws.append(["RG", "Name", "Location", "Input Schema", "Endpoint", "Public Network Access",
+                   "Provisioning State", "Domain Topics Count"])
+        for rg_name, d in self._all_resources_flat("event_grid_domains"):
+            self._wr(ws, [rg_name, d.get("name"), d.get("location"), d.get("input_schema"),
+                d.get("endpoint"), d.get("public_network_access"), d.get("provisioning_state"),
+                d.get("domain_topics_count", 0)])
 
     def _add_identity_sheet(self):
         ws = self._wb.create_sheet("Identities and RBAC")
@@ -3004,8 +3415,8 @@ def parse_args():
     p.add_argument("--config", default=None, dest="config_path",
                    help="Path to config.json (default: ./config.json)")
     p.add_argument("--subscription-id",
-                   default=cfg.get("subscription_id", ""), dest="subscription_id",
-                   help="Azure subscription GUID to scan")
+                   default="", dest="subscription_id",
+                   help="(Optional) Single subscription GUID override — adds to subscription_ids from config.json")
     p.add_argument("--output-dir",
                    default=cfg.get("output_dir", "./migration-output"), dest="output_dir")
     p.add_argument("--parallel-workers", type=int,
@@ -3066,6 +3477,15 @@ def parse_args():
         if not hasattr(args, key):
             setattr(args, key, cfg.get(key, fallback))
 
+    # Inject a single --subscription-id CLI override into subscription_ids if provided
+    placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    single_id = getattr(args, "subscription_id", "").strip()
+    if single_id and single_id != placeholder:
+        ids = list(getattr(args, "subscription_ids", []))
+        if single_id not in ids:
+            ids.insert(0, single_id)
+        args.subscription_ids = ids
+
     return args, cfg
 
 
@@ -3088,14 +3508,6 @@ def main():
         _AZ_CMD   = [_AZ_EXE]
         _AZ_SHELL = _AZ_EXE.lower().endswith((".cmd", ".bat"))
 
-    # ── validate subscription_id ──────────────────────────────────────────────
-    placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-    if not args.subscription_id or args.subscription_id == placeholder:
-        print("[ERROR] subscription_id is not set.")
-        print("        Edit config.json → \"subscription_id\": \"<YOUR GUID>\"")
-        print("        Or pass --subscription-id <GUID> on the command line.")
-        sys.exit(1)
-
     out = Path(args.output_dir)
     for sub_dir in ["raw-data", "dependency", "reports"]:
         (out / sub_dir).mkdir(parents=True, exist_ok=True)
@@ -3106,24 +3518,28 @@ def main():
 ╔══════════════════════════════════════════╗
 ║  Azure Migration Inventory Tool v2.0     ║
 ╚══════════════════════════════════════════╝""")
-    tracker.log_info("Mode           : READ-ONLY — no Azure resources will be created, modified, or deleted")
-    tracker.log_info("Git            : READ-ONLY — only git clone (no push/commit/write)")
-    tracker.log_info(f"Config loaded  : {Path(__file__).parent / 'config.json'}")
-    tracker.log_info(f"Subscription ID: {args.subscription_id}")
-    tracker.log_info(f"Output dir     : {args.output_dir}")
-    tracker.log_info(f"Workers        : {args.parallel_workers}")
-    tracker.log_info(f"Reports        : HTML={'off' if args.skip_html else 'on'}, Excel={'off' if args.skip_excel else 'on'}")
+    tracker.log_info("Mode    : READ-ONLY — no Azure resources will be created, modified, or deleted")
+    tracker.log_info("Git     : READ-ONLY — only git clone (no push/commit/write)")
+    tracker.log_info(f"Config  : {Path(__file__).parent / 'config.json'}")
+    # Report what subscription filter was specified in config
+    _ids   = getattr(args, 'subscription_ids',   [])
+    _names = getattr(args, 'subscription_names', [])
+    if _ids:
+        tracker.log_info(f"Sub IDs : {', '.join(_ids)}")
+    if _names:
+        tracker.log_info(f"Sub names: {', '.join(_names)}")
+    tracker.log_info(f"Output  : {args.output_dir}")
+    tracker.log_info(f"Workers : {args.parallel_workers}")
+    tracker.log_info(f"Reports : HTML={'off' if args.skip_html else 'on'}, Excel={'off' if args.skip_excel else 'on'}")
     if args.excluded_resource_groups:
-        tracker.log_info(f"Excluded RGs   : {', '.join(args.excluded_resource_groups)}")
+        tracker.log_info(f"Excl RGs: {', '.join(args.excluded_resource_groups)}")
     if args.included_resource_groups:
-        tracker.log_info(f"Included RGs   : {', '.join(args.included_resource_groups)}")
+        tracker.log_info(f"Incl RGs: {', '.join(args.included_resource_groups)}")
 
     # ── check az login ────────────────────────────────────────────────────────
-    tracker.log_info(f"az CLI        : {' '.join(_AZ_CMD)}")
+    tracker.log_info(f"az CLI  : {' '.join(_AZ_CMD)}")
     sub_info = run_az(["account", "show"], verbose=True)
     if not sub_info:
-        # run_az exits on FileNotFoundError — reaching here means az IS present
-        # but not logged in or the token has expired
         print("[ERROR] Azure CLI is installed but you are not logged in, "
               "or your login session has expired.")
         print("        Run:  az login")
@@ -3131,18 +3547,7 @@ def main():
         print("              az login --service-principal "
               "-u <APP_ID> -p <SECRET> --tenant <TENANT_ID>")
         sys.exit(1)
-
-    # "az account set" only changes the local CLI context — it does NOT modify any
-    # Azure resource. Call subprocess directly to bypass the run_az write-verb guard.
-    acct_parts = ["account", "set", "--subscription", args.subscription_id, "--output", "none"]
-    acct_cmd, acct_shell = _az_subprocess_args(acct_parts[:-2])   # without --output json
-    # rebuild without --output json suffix that _az_subprocess_args appends
-    if acct_shell:
-        acct_run = f'"{_AZ_EXE}" account set --subscription {args.subscription_id} --output none'
-    else:
-        acct_run = _AZ_CMD + ["account", "set", "--subscription", args.subscription_id, "--output", "none"]
-    subprocess.run(acct_run, capture_output=True, text=True, timeout=30, shell=acct_shell)
-    tracker.log_info(f"Subscription   : {sub_info.get('name')} | Tenant: {sub_info.get('tenantId')}")
+    tracker.log_info(f"Logged in as: {sub_info.get('name')} | Tenant: {sub_info.get('tenantId')}")
 
     start_time = time.time()
     inventory  = collect_inventory(args, tracker)

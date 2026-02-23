@@ -611,21 +611,21 @@ class AzureDiscovery:
                     for sub in all_subs[:5]:  # Show first 5
                         self.logger.warning(f"    - {sub.display_name} ({sub.subscription_id})")
             else:
-                # Get all enabled subscriptions
-                self.logger.info("Scanning ALL subscriptions...")
-                for sub in sub_client.subscriptions.list():
-                    if sub.state == 'Enabled':
-                        subscriptions.append({
-                            'id': sub.subscription_id,
-                            'name': sub.display_name,
-                            'state': sub.state
-                        })
-            
-            self.logger.info(f"✓ Found {len(subscriptions)} subscription(s) to scan:")
-            for sub in subscriptions:
-                self.logger.info(f"  - {sub['name']} ({sub['id']})")
-            
-            return subscriptions
+                # Neither subscription_ids nor subscription_names provided — halt.
+                self.logger.error("")
+                self.logger.error("  " + "!" * 68)
+                self.logger.error("  !! ERROR: No subscriptions mentioned in config.json.")
+                self.logger.error("  !!")
+                self.logger.error("  !! Add at least one of these fields to config.json:")
+                self.logger.error("  !!   \"subscription_ids\":   [\"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\"]")
+                self.logger.error("  !!   \"subscription_names\": [\"My Production Subscription\"]")
+                self.logger.error("  !!")
+                self.logger.error("  !! Names are case-insensitive and support partial matching.")
+                self.logger.error("  " + "!" * 68)
+                self.logger.error("")
+                raise ValueError(
+                    "No subscription_ids or subscription_names configured in config.json. "
+                    "Add at least one subscription to proceed.")
             
         except Exception as e:
             self.logger.error(f"Failed to get subscriptions: {e}")
@@ -6365,9 +6365,26 @@ function exportCSV(){{
                     'error': 'No subscriptions found'
                 }
             
-            # Discover resources in each subscription
-            for sub in subscriptions:
+            # Discover resources in each subscription — run in parallel
+            self.logger.info(f"Scanning {len(subscriptions)} subscription(s) in parallel...")
+            def _discover_sub(sub):
                 self.discover_subscription_resources(sub['id'], sub['name'])
+
+            max_sub_workers = min(len(subscriptions), int(self.config.get('parallel_workers', 4)))
+            if max_sub_workers > 1:
+                from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
+                with _TPE(max_workers=max_sub_workers) as _ex:
+                    _futs = {_ex.submit(_discover_sub, s): s for s in subscriptions}
+                    for _fut in _ac(_futs):
+                        _s = _futs[_fut]
+                        try:
+                            _fut.result()
+                            self.logger.info(f"  ✓ Completed: {_s['name']}")
+                        except Exception as _e:
+                            self.logger.error(f"  ✗ Failed: {_s['name']}: {_e}")
+            else:
+                for sub in subscriptions:
+                    self.discover_subscription_resources(sub['id'], sub['name'])
             
             # Analyze dependencies
             self.analyze_dependencies()
