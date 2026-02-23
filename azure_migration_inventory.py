@@ -55,8 +55,12 @@ def run_az(args_list, verbose=False):
             f"READ-ONLY VIOLATION: az command contains write verb(s) {forbidden}. "
             f"Full args: {args_list}")
     try:
+        full_cmd = _AZ_CMD + args_list + ["--output", "json"]
+        # When shell=True on Windows the command must be a string, not a list.
+        # Passing a list with shell=True silently drops all arguments after [0].
+        cmd_arg = " ".join(full_cmd) if _AZ_SHELL else full_cmd
         result = subprocess.run(
-            _AZ_CMD + args_list + ["--output", "json"],
+            cmd_arg,
             capture_output=True, text=True, timeout=120,
             shell=_AZ_SHELL
         )
@@ -66,9 +70,9 @@ def run_az(args_list, verbose=False):
             return None
         return json.loads(result.stdout) if result.stdout.strip() else None
     except FileNotFoundError:
-        print(f"[ERROR] Azure CLI not found at: {' '.join(_AZ_CMD)}")
-        print("        Install from: https://aka.ms/installazurecliwindows")
-        print("        Then restart this terminal and run again.")
+        print(f"[ERROR] Azure CLI not found. Searched for: {_AZ_EXE}")
+        print("        Install from : https://aka.ms/installazurecliwindows")
+        print("        After install, open a NEW terminal and run: az login")
         sys.exit(1)
     except Exception as e:
         if verbose:
@@ -3029,7 +3033,7 @@ def parse_args():
 
 
 def main():
-    global _AZ_CMD
+    global _AZ_CMD, _AZ_EXE, _AZ_SHELL
 
     args, cfg = parse_args()
 
@@ -3043,8 +3047,9 @@ def main():
 
     # ── apply custom az CLI path ──────────────────────────────────────────────
     if args.az_path:
-        _AZ_CMD = [args.az_path]
-        _AZ_SHELL = False   # explicit path — no shell needed
+        _AZ_CMD   = [args.az_path]
+        _AZ_EXE   = args.az_path
+        _AZ_SHELL = args.az_path.lower().endswith((".cmd", ".bat"))
 
     # ── validate subscription_id ──────────────────────────────────────────────
     placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
@@ -3092,8 +3097,9 @@ def main():
 
     # "az account set" only changes the local CLI context — it does NOT modify any
     # Azure resource. Call subprocess directly to bypass the run_az write-verb guard.
+    acct_cmd = _AZ_CMD + ["account", "set", "--subscription", args.subscription_id, "--output", "none"]
     subprocess.run(
-        _AZ_CMD + ["account", "set", "--subscription", args.subscription_id, "--output", "none"],
+        " ".join(acct_cmd) if _AZ_SHELL else acct_cmd,
         capture_output=True, text=True, timeout=30, shell=_AZ_SHELL
     )
     tracker.log_info(f"Subscription   : {sub_info.get('name')} | Tenant: {sub_info.get('tenantId')}")
