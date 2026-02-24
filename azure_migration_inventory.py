@@ -340,7 +340,10 @@ class AzureInventoryCollector:
         collectors = [fn for flag, fn in FLAG_MAP if getattr(a, flag, True)]
 
         futures = {}
-        with ThreadPoolExecutor(max_workers=4) as ex:
+        # Use enough workers to run all collector types concurrently.
+        # Cap at parallel_workers to avoid overwhelming the az CLI process pool.
+        _rg_workers = max(getattr(a, 'parallel_workers', 8), len(collectors))
+        with ThreadPoolExecutor(max_workers=_rg_workers) as ex:
             for fn in collectors:
                 futures[ex.submit(fn, rg_name)] = fn.__name__
 
@@ -364,7 +367,8 @@ class AzureInventoryCollector:
         """Shared logic for web apps and function apps."""
         cmd = "functionapp" if is_func else "webapp"
         futures = {}
-        with ThreadPoolExecutor(max_workers=3) as ex:
+        # 6 independent az CLI calls — run all concurrently
+        with ThreadPoolExecutor(max_workers=6) as ex:
             futures["show"]     = ex.submit(self._az, [cmd, "show", "-n", name, "-g", rg])
             futures["settings"] = ex.submit(self._az, [cmd, "config", "appsettings", "list", "-n", name, "-g", rg])
             futures["conn"]     = ex.submit(self._az, [cmd, "config", "connection-string", "list", "-n", name, "-g", rg])
@@ -1888,6 +1892,27 @@ class HTMLReportGenerator:
             for res_type, res_list in rg_data.get("resources", {}).items():
                 yield res_type, res_list
 
+    # ── service-team tag helpers ──────────────────────────────────────────────
+    _SVC_TEAM_TAG_KEYS = frozenset(('serviceteam', 'service-team', 'service_team'))
+
+    def _get_res_svc_team(self, res: dict) -> str:
+        """Return the value of the serviceTeam/service-team/service_team tag, or ''."""
+        for k, v in (res.get("tags") or {}).items():
+            if k.lower() in self._SVC_TEAM_TAG_KEYS:
+                return str(v)
+        return ''
+
+    def _collect_tag_teams(self) -> dict:
+        """Return {team_name: [(rg_name, res_type, res), ...]} for all tag-based teams."""
+        result: dict = {}
+        for rg_name, rg_data in self.inv.get("resource_groups", {}).items():
+            for res_type, res_list in rg_data.get("resources", {}).items():
+                for res in res_list:
+                    t = self._get_res_svc_team(res)
+                    if t:
+                        result.setdefault(t, []).append((rg_name, res_type, res))
+        return result
+
     def _css(self):
         return """<style>
 *{box-sizing:border-box}
@@ -1996,10 +2021,8 @@ function _doGlobalSearch(val){
   // Show/hide parent <details> based on visible child rows; auto-expand matching ones
   document.querySelectorAll('details').forEach(function(d){
     var hasMatch=Array.from(d.querySelectorAll('tbody tr')).some(function(tr){return tr.style.display!=='none';});
-    // Also check data-team on the details itself (hides whole section if team doesn't match)
-    var teamOk=!_activeTeam||!d.dataset.team||(d.dataset.team===_activeTeam);
-    d.style.display=(hasMatch && teamOk)?'':'none';
-    if(hasMatch && teamOk) d.open=true;
+    d.style.display=hasMatch?'':'none';
+    if(hasMatch) d.open=true;
   });
   // Also search dependency flow boxes (pre.flow-box) in the Dep Flows section
   document.querySelectorAll('pre.flow-box').forEach(function(pre){
@@ -2072,8 +2095,10 @@ document.addEventListener('DOMContentLoaded',function(){
         return "\n".join(parts)
 
     def _build_html(self):
+        tag_teams = self._collect_tag_teams()   # {team_name: [(rg, res_type, res), ...]}
         nav_links = [
             ("#summary","Summary"), ("#resource-groups","Resource Groups"),
+            ("#service-teams","Service Teams"),
             ("#dep-flows","Dep Flows"), ("#dep-table","Dep Table"),
             ("#risks","Risk Register"), ("#migration-order","Migration Order"),
             ("#checklist","Checklist"),
@@ -2084,16 +2109,34 @@ document.addEventListener('DOMContentLoaded',function(){
                + 'oninput="globalSearch(this.value)" autocomplete="off">'
                + '<span id="search-count"></span>'
                + '</nav>')
-        team_pills = ('<div id="team-filter-bar">'
-                     + '<span>Filter by team:</span>'
-                     + '<button class="team-pill active" data-team="all" onclick="filterByTeam(\'all\')">All</button>'
-                     + ''.join(
-                         f'<button class="team-pill" data-team="{slug}" '
-                         f'onclick="filterByTeam(\'{slug}\')">'
-                         f'{label}</button>'
-                         for slug, (label, _) in self._TEAM_LABELS.items()
-                     )
-                     + '</div>')
+        # Static type-based team pills
+        static_pills = (
+            '<button class="team-pill active" data-team="all" onclick="filterByTeam(\'all\')">All</button>'
+            + ''.join(
+                f'<button class="team-pill" data-team="{slug}" '
+                f'onclick="filterByTeam(\'{slug}\')">'
+                f'{label}</button>'
+                for slug, (label, _) in self._TEAM_LABELS.items()
+            )
+        )
+        # Dynamic tag-based service-team pills (prefixed with "tag:")
+        tag_pills_html = ''.join(
+            f'<button class="team-pill" style="background:#f0f8ff;color:#0078D4;border-color:#0078D4" '
+            f'data-team="{self._esc(t)}" onclick="filterByTeam(\'{self._esc(t)}\')">'
+            f'&#128101; {self._esc(t)}</button>'
+            for t in sorted(tag_teams.keys())
+        )
+        tag_section_html = (
+            '<span style="margin-left:12px;color:#666;font-size:12px">Service Team tags:</span>'
+            + tag_pills_html
+        ) if tag_teams else ''
+        team_pills = (
+            '<div id="team-filter-bar">'
+            + '<span>Filter by team:</span>'
+            + static_pills
+            + tag_section_html
+            + '</div>'
+        )
         parts = [
             "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>",
             "<meta name='viewport' content='width=device-width,initial-scale=1'>",
@@ -2104,6 +2147,7 @@ document.addEventListener('DOMContentLoaded',function(){
             team_pills,
             self._section_summary(),
             self._section_resource_groups(),
+            self._section_service_teams(tag_teams),
             self._section_dep_flows(),
             self._section_dep_table(),
             self._section_risks(),
@@ -2146,7 +2190,7 @@ document.addEventListener('DOMContentLoaded',function(){
                               f'padding:1px 7px;border-radius:10px;font-weight:normal;vertical-align:middle">'
                               f'{team_label}</span>') if team_label else ''
                 parts.append(f'<details{team_attr}><summary>{label} ({len(res_list)}){team_badge}</summary><div class="card">')
-                parts.append('<table><thead><tr><th>Name</th><th>Location</th><th>Tags</th><th>Details</th><th>Migration Notes</th></tr></thead><tbody>')
+                parts.append('<table><thead><tr><th>Name</th><th>Location</th><th>Tags</th><th>Service Team</th><th>Details</th><th>Migration Notes</th></tr></thead><tbody>')
                 for res in res_list:
                     name = self._esc(res.get("name",""))
                     loc2 = self._esc(res.get("location",""))
@@ -2154,6 +2198,16 @@ document.addEventListener('DOMContentLoaded',function(){
                         f'<span class="chip chip-other">{self._esc(k)}</span>'
                         for k in (res.get("tags") or {}).keys()
                     )
+                    # ── service-team tag override ──────────────────────────
+                    svc_team_val = self._get_res_svc_team(res)
+                    res_team_attr = (f' data-team="{self._esc(svc_team_val)}"'
+                                     if svc_team_val else team_attr)
+                    svc_team_pill = (
+                        f'<span class="chip" style="background:#0078D4;color:white;font-size:10px">'
+                        f'{self._esc(svc_team_val)}</span>'
+                        if svc_team_val else '<span style="color:#999;font-size:11px">—</span>'
+                    )
+                    # ──────────────────────────────────────────────────────
                     nid_candidates = [k for k in edge_index if res.get("name","").lower() in k.lower()]
                     dep_chips = ""
                     for nid in nid_candidates:
@@ -2173,8 +2227,64 @@ document.addEventListener('DOMContentLoaded',function(){
                     elif res_type == "key_vaults":
                         details = f"URI: {self._esc(res.get('vault_uri',''))} | RBAC: {res.get('enable_rbac')}"
                     notes = " | ".join(res.get("bicep_notes", []))
-                    parts.append(f'<tr{team_attr}><td><strong>{name}</strong>{dep_chips}</td><td>{loc2}</td><td>{tag_pills}</td><td>{details}</td><td>{self._esc(notes)}</td></tr>')
+                    parts.append(f'<tr{res_team_attr}><td><strong>{name}</strong>{dep_chips}</td><td>{loc2}</td><td>{tag_pills}</td><td>{svc_team_pill}</td><td>{details}</td><td>{self._esc(notes)}</td></tr>')
                 parts.append('</tbody></table></div></details>')
+        parts.append('</div>')
+        return "\n".join(parts)
+
+    def _section_service_teams(self, tag_teams: dict):
+        """Render a section grouping all resources by their serviceTeam/service-team tag."""
+        parts = ['<div id="service-teams" class="page"><h2>&#128101; Service Teams</h2>']
+        if not tag_teams:
+            parts.append('<div class="card"><em>No resources have a <code>serviceTeam</code>, '
+                         '<code>service-team</code>, or <code>service_team</code> tag. '
+                         'Add that tag to your Azure resources to enable grouping here.</em></div>')
+            parts.append('</div>')
+            return "\n".join(parts)
+
+        total = sum(len(v) for v in tag_teams.values())
+        parts.append(f'<div class="card" style="margin-bottom:12px">'
+                     f'<strong>{total}</strong> resources tagged across '
+                     f'<strong>{len(tag_teams)}</strong> service team(s).</div>')
+
+        for team_name in sorted(tag_teams.keys()):
+            entries = tag_teams[team_name]
+            esc_name = self._esc(team_name)
+            parts.append(
+                f'<details open data-team="{esc_name}">'
+                f'<summary>'
+                f'<span style="display:inline-block;background:#0078D4;color:white;'
+                f'padding:2px 10px;border-radius:12px;font-size:12px;margin-right:6px">'
+                f'{esc_name}</span>'
+                f'{len(entries)} resource(s)'
+                f'</summary>'
+                f'<div class="card">'
+            )
+            parts.append('<table><thead><tr>'
+                         '<th>Resource Name</th><th>Type</th>'
+                         '<th>Resource Group</th><th>Location</th>'
+                         '<th>Other Tags</th></tr></thead><tbody>')
+            for rg_name, res_type, res in sorted(entries, key=lambda x: x[2].get("name","").lower()):
+                rname = self._esc(res.get("name", ""))
+                rloc  = self._esc(res.get("location", ""))
+                rtype = self._esc(res_type.replace("_", " ").title())
+                rrg   = self._esc(rg_name)
+                other_tags = " ".join(
+                    f'<span class="chip chip-other">{self._esc(k)}: {self._esc(v)}</span>'
+                    for k, v in (res.get("tags") or {}).items()
+                    if k.lower() not in self._SVC_TEAM_TAG_KEYS
+                ) or '<span style="color:#999;font-size:11px">—</span>'
+                parts.append(
+                    f'<tr data-team="{esc_name}">'
+                    f'<td><strong>{rname}</strong></td>'
+                    f'<td>{rtype}</td>'
+                    f'<td>{rrg}</td>'
+                    f'<td>{rloc}</td>'
+                    f'<td>{other_tags}</td>'
+                    f'</tr>'
+                )
+            parts.append('</tbody></table></div></details>')
+
         parts.append('</div>')
         return "\n".join(parts)
 
@@ -3851,7 +3961,9 @@ def parse_args():
         _repo_names, _repo_branch_map = [], {}
         for _proj in _projs_raw:
             for _repo in (_proj.get("repositories") or []):
-                _rname  = _repo if isinstance(_repo, str) else _repo.get("name", "")
+                # config.json uses 'repo_name'; accept 'name' as fallback for backward compat
+                _rname  = _repo if isinstance(_repo, str) else (
+                    _repo.get("repo_name", "") or _repo.get("name", ""))
                 _branch = "" if isinstance(_repo, str) else _repo.get("branch", "")
                 if _rname and not _PLACEHOLDER(_rname):
                     _repo_names.append(_rname)

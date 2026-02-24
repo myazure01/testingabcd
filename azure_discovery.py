@@ -66,6 +66,7 @@ try:
     from azure.mgmt.datafactory import DataFactoryManagementClient
     from azure.mgmt.cdn import CdnManagementClient
     from azure.mgmt.frontdoor import FrontDoorManagementClient
+    from azure.core.pipeline.policies import HTTPPolicy
     # msgraph.core is optional - comment out if not needed
     # from msgraph.core import GraphClient
     import requests
@@ -203,6 +204,27 @@ def _add_dep_from_hint(hint, setting_key, app_name, source_type, sub_id, depende
     })
 
 
+class _ReadOnlyHttpPolicy(HTTPPolicy):
+    """Azure SDK pipeline policy that enforces read-only behaviour.
+
+    If ``read_only_enforce`` is True in config.json, this policy is attached
+    to every Azure Management SDK client.  Any HTTP method other than GET,
+    HEAD or OPTIONS will raise a RuntimeError immediately — before the request
+    reaches the network — making accidental write operations impossible.
+    """
+    _SAFE_METHODS = frozenset({'GET', 'HEAD', 'OPTIONS'})
+
+    def send(self, request):
+        method = (request.http_request.method or '').upper()
+        if method not in _ReadOnlyHttpPolicy._SAFE_METHODS:
+            raise RuntimeError(
+                f"READ-ONLY VIOLATION: azure_discovery.py attempted a"
+                f" {method} request to {request.http_request.url}. "
+                f"Only read (GET/HEAD/OPTIONS) calls are permitted."
+            )
+        return self.next.send(request)
+
+
 class AzureDiscovery:
     """Main Azure Discovery class"""
 
@@ -261,6 +283,15 @@ class AzureDiscovery:
         self.config = self._load_config(config_file)
         self.setup_logging()
         self.credential = self._get_credential()
+        # Lock used to serialise writes to shared lists/dicts when parallel workers
+        # are active (e.g. arm_templates.extend inside scan_repository_code).
+        self._scan_lock = threading.Lock()
+        # Optional read-only enforcement: attach _ReadOnlyHttpPolicy to every SDK client.
+        # Enable in config.json: "read_only_enforce": true
+        _enforce = self.config.get('read_only_enforce', True)
+        self._ro_policies = [_ReadOnlyHttpPolicy()] if _enforce else []
+        if _enforce:
+            self.logger.info("READ-ONLY ENFORCEMENT: active — non-GET SDK calls will raise RuntimeError")
         self.discovery_data = {
             'metadata': {
                 'discovery_date': datetime.now().isoformat(),
@@ -310,7 +341,12 @@ class AzureDiscovery:
         return default_config
     
     def _build_devops_repo_urls(self, config: Dict):
-        """Build Azure DevOps repository URLs from parameterized configuration"""
+        """Build Azure DevOps repository URLs from parameterized configuration.
+
+        When a project entry has an empty / missing 'repositories' list, this
+        method calls the Azure DevOps REST API (GET _apis/git/repositories) to
+        enumerate ALL repositories in that project automatically.
+        """
         import urllib.parse
 
         if 'azure_devops' not in config:
@@ -355,23 +391,84 @@ class AzureDiscovery:
         if not config.get('git_repos'):
             config['git_repos'] = []
         
+        # Build base64-encoded Basic auth header for REST API calls
+        import base64
+        _auth_bytes = base64.b64encode(f":{pat_token}".encode('utf-8')).decode('utf-8')
+        _rest_headers = {
+            'Authorization': f'Basic {_auth_bytes}',
+            'Accept': 'application/json',
+        }
+
+        def _list_all_repos_for_project(org: str, project: str) -> list:
+            """Call DevOps REST API to get all repo names in a project."""
+            api_url = (
+                f"https://dev.azure.com/{urllib.parse.quote(org, safe='')}/"
+                f"{urllib.parse.quote(project, safe='')}/"
+                f"_apis/git/repositories?api-version=7.0"
+            )
+            try:
+                resp = requests.get(api_url, headers=_rest_headers, timeout=30,
+                                    verify=False)
+                if resp.status_code == 200:
+                    repos_json = resp.json()
+                    names = [r['name'] for r in repos_json.get('value', [])]
+                    print(f"  ✓ Auto-discovered {len(names)} repo(s) in project '{project}': {names}")
+                    return names
+                else:
+                    print(f"  !! DevOps REST API returned {resp.status_code} for project '{project}'")
+                    print(f"     URL: {api_url}")
+                    if resp.status_code in (401, 203):
+                        print(f"  !! PAT token rejected or lacks 'Code (Read)' scope.")
+                        print(f"     DevOps → User Settings → Personal Access Tokens → Code (Read)")
+                    elif resp.status_code == 404:
+                        print(f"  !! Project '{project}' not found in org '{org}'.")
+                        print(f"     Check azure_devops.projects[].project_name in config.json")
+            except requests.exceptions.SSLError:
+                # Retry without SSL verification (corporate proxy / self-signed cert)
+                try:
+                    resp2 = requests.get(api_url, headers=_rest_headers, timeout=30, verify=False)
+                    if resp2.status_code == 200:
+                        names = [r['name'] for r in resp2.json().get('value', [])]
+                        print(f"  ✓ Auto-discovered {len(names)} repo(s) in project '{project}' (SSL bypass)")
+                        return names
+                except Exception as e2:
+                    print(f"  !! REST API call failed (SSL bypass also failed): {e2}")
+            except Exception as e:
+                print(f"  !! Could not reach DevOps REST API for project '{project}': {e}")
+            return []
+
         added = 0
         for project_config in projects:
             project_name = project_config.get('project_name', '')
+            # Support both 'repositories' (list of dicts) and missing/empty list
             repositories = project_config.get('repositories', [])
             
             if not project_name or 'YOUR_' in str(project_name):
                 print(f"  !! Skipping project — placeholder or empty name: '{project_name}'")
                 print( "  !! Fix: set azure_devops.projects[].project_name in config.json")
                 continue
+
+            # ── Auto-discover repos via REST API if list is empty ────────────
+            if not repositories:
+                print(f"  ℹ repositories[] is empty for project '{project_name}' — "
+                      f"auto-discovering via Azure DevOps REST API...")
+                discovered = _list_all_repos_for_project(organization, project_name)
+                repositories = [{'repo_name': n} for n in discovered]
+                if not repositories:
+                    print(f"  !! No repositories found for project '{project_name}'. "
+                          f"Check project name and PAT permissions.")
+                    continue
             
             for repo in repositories:
+                # ── FIELD NAME FIX ───────────────────────────────────────────
+                # config.json uses 'repo_name'; older entries may use 'name'
                 if isinstance(repo, dict):
-                    repo_name = repo.get('name', '')
+                    repo_name   = repo.get('repo_name', '') or repo.get('name', '')
                     repo_branch = repo.get('branch', None)
                 else:
-                    repo_name = repo
+                    repo_name   = str(repo)
                     repo_branch = None
+                # ─────────────────────────────────────────────────────────────
                 
                 if not repo_name or 'YOUR_' in str(repo_name):
                     continue
@@ -384,7 +481,8 @@ class AzureDiscovery:
                     f"{urllib.parse.quote(project_name, safe='')}/"
                     f"_git/{urllib.parse.quote(repo_name, safe='')}"
                 )
-                config['git_repos'].append({'url': repo_url, 'branch': repo_branch})
+                config['git_repos'].append({'url': repo_url, 'branch': repo_branch,
+                                             'project': project_name, 'repo': repo_name})
                 print(f"  ✓ Added Azure DevOps repo: {organization}/{project_name}/{repo_name}"
                       + (f" (branch: {repo_branch})" if repo_branch else ""))
                 added += 1
@@ -396,8 +494,9 @@ class AzureDiscovery:
             print("  !! All project/repository names are empty or still placeholders.")
             print("  !! FIX: open config.json and update:")
             print("  !!   azure_devops.projects[].project_name  → exact DevOps project name")
-            print("  !!   azure_devops.projects[].repositories[].name → exact repo name")
+            print("  !!   azure_devops.projects[].repositories[].repo_name → exact repo name")
             print("  !!   (case-sensitive, must match exactly what you see in Azure DevOps Repos)")
+            print("  !! TIP: leave repositories[] empty to auto-discover all repos in a project")
             print("  " + "!"*70)
             print("")
     
@@ -673,13 +772,14 @@ class AzureDiscovery:
         }
         
         try:
-            # Initialize clients
-            resource_client = ResourceManagementClient(self.credential, subscription_id)
-            network_client = NetworkManagementClient(self.credential, subscription_id)
-            compute_client = ComputeManagementClient(self.credential, subscription_id)
-            web_client = WebSiteManagementClient(self.credential, subscription_id)
-            sql_client = SqlManagementClient(self.credential, subscription_id)
-            storage_client = StorageManagementClient(self.credential, subscription_id)
+            # Initialize clients — per_call_policies enforces read-only when enabled
+            _kw = dict(per_call_policies=self._ro_policies) if self._ro_policies else {}
+            resource_client = ResourceManagementClient(self.credential, subscription_id, **_kw)
+            network_client = NetworkManagementClient(self.credential, subscription_id, **_kw)
+            compute_client = ComputeManagementClient(self.credential, subscription_id, **_kw)
+            web_client = WebSiteManagementClient(self.credential, subscription_id, **_kw)
+            sql_client = SqlManagementClient(self.credential, subscription_id, **_kw)
+            storage_client = StorageManagementClient(self.credential, subscription_id, **_kw)
             
             # Discover Resource Groups
             self.logger.info("Discovering resource groups...")
@@ -748,23 +848,27 @@ class AzureDiscovery:
             
             self.discovery_data['summary']['total_resources'] += len(sub_data['resources'])
             
-            # Discover Networks (VNets, Subnets, NSGs, etc.)
-            self.discover_networking(network_client, sub_data)
-            
-            # Discover Virtual Machines
-            self.discover_virtual_machines(compute_client, sub_data)
-            
-            # Discover App Services
-            self.discover_app_services(web_client, sub_data, subscription_id)
-            
-            # Discover SQL Databases
-            self.discover_sql_databases(sql_client, sub_data)
-            
-            # Discover Storage Accounts
-            self.discover_storage_accounts(storage_client, sub_data)
-            
-            # Discover other PaaS services
-            self.discover_paas_services(subscription_id, sub_data)
+            # ── Run all resource-type discoverers in PARALLEL ─────────────────
+            # Each function writes to a distinct key of sub_data so no lock needed.
+            _max_w = self.config.get('parallel_workers', 8)
+            _discover_tasks = {
+                'networking':       lambda: self.discover_networking(network_client, sub_data),
+                'virtual_machines': lambda: self.discover_virtual_machines(compute_client, sub_data),
+                'app_services':     lambda: self.discover_app_services(web_client, sub_data, subscription_id),
+                'sql_databases':    lambda: self.discover_sql_databases(sql_client, sub_data),
+                'storage_accounts': lambda: self.discover_storage_accounts(storage_client, sub_data),
+                'paas_services':    lambda: self.discover_paas_services(subscription_id, sub_data),
+            }
+            self.logger.info(f"Running {len(_discover_tasks)} discovery tasks in parallel (max_workers={_max_w})...")
+            with ThreadPoolExecutor(max_workers=_max_w) as _pool:
+                _futs = {_pool.submit(fn): name for name, fn in _discover_tasks.items()}
+                for _fut in as_completed(_futs):
+                    _name = _futs[_fut]
+                    try:
+                        _fut.result()
+                    except Exception as _e:
+                        self.logger.error(f"Error in {_name} discovery: {_e}")
+                        self.logger.error(traceback.format_exc())
             
             # Store subscription data
             self.discovery_data['subscriptions'][subscription_id] = sub_data
@@ -778,8 +882,21 @@ class AzureDiscovery:
         self.logger.info("Discovering networking resources...")
         
         try:
+            # Fetch all five networking resource types in parallel
+            with ThreadPoolExecutor(max_workers=5) as _net_pool:
+                _f_vnets = _net_pool.submit(lambda: list(network_client.virtual_networks.list_all()))
+                _f_nsgs  = _net_pool.submit(lambda: list(network_client.network_security_groups.list_all()))
+                _f_pips  = _net_pool.submit(lambda: list(network_client.public_ip_addresses.list_all()))
+                _f_lbs   = _net_pool.submit(lambda: list(network_client.load_balancers.list_all()))
+                _f_agws  = _net_pool.submit(lambda: list(network_client.application_gateways.list_all()))
+            # All futures resolved; retrieve results (exceptions re-raised here if needed)
+            vnets          = _f_vnets.result()
+            nsgs_raw       = _f_nsgs.result()
+            public_ips_raw = _f_pips.result()
+            lbs_raw        = _f_lbs.result()
+            agws_raw       = _f_agws.result()
+
             # Virtual Networks
-            vnets = list(network_client.virtual_networks.list_all())
             for vnet in vnets:
                 vnet_info = {
                     'name': vnet.name,
@@ -817,8 +934,8 @@ class AzureDiscovery:
             self.logger.info(f"  ✓ Found {len(vnets)} Virtual Networks")
             self.discovery_data['summary']['vnets'] += len(vnets)
             
-            # Network Security Groups
-            nsgs = list(network_client.network_security_groups.list_all())
+            # Network Security Groups (already fetched in parallel above)
+            nsgs = nsgs_raw
             nsg_data = []
             for nsg in nsgs:
                 nsg_info = {
@@ -849,8 +966,8 @@ class AzureDiscovery:
             self.logger.info(f"  ✓ Found {len(nsgs)} Network Security Groups")
             self.discovery_data['summary']['nsgs'] += len(nsgs)
             
-            # Public IP Addresses
-            public_ips = list(network_client.public_ip_addresses.list_all())
+            # Public IP Addresses (already fetched in parallel above)
+            public_ips = public_ips_raw
             pip_data = []
             for pip in public_ips:
                 pip_data.append({
@@ -866,8 +983,8 @@ class AzureDiscovery:
             sub_data['public_ips'] = pip_data
             self.logger.info(f"  ✓ Found {len(public_ips)} Public IP Addresses")
             
-            # Load Balancers
-            load_balancers = list(network_client.load_balancers.list_all())
+            # Load Balancers (already fetched in parallel above)
+            load_balancers = lbs_raw
             lb_data = []
             for lb in load_balancers:
                 lb_data.append({
@@ -883,8 +1000,8 @@ class AzureDiscovery:
             sub_data['load_balancers'] = lb_data
             self.logger.info(f"  ✓ Found {len(load_balancers)} Load Balancers")
             
-            # Application Gateways
-            app_gateways = list(network_client.application_gateways.list_all())
+            # Application Gateways (already fetched in parallel above)
+            app_gateways = agws_raw
             agw_data = []
             for agw in app_gateways:
                 agw_data.append({
@@ -997,7 +1114,9 @@ class AzureDiscovery:
         
         try:
             apps = list(web_client.web_apps.list())
-            for app in apps:
+
+            def _process_single_app(app):
+                """Fully process one App Service: build info dict + fetch all details in parallel."""
                 app_info = {
                     'name': app.name,
                     'id': app.id,
@@ -1020,22 +1139,24 @@ class AzureDiscovery:
                     'deployment_slots': [],
                     'tags': app.tags or {}
                 }
-
-                # Define rg_name once outside all try-blocks so subsequent blocks can use it
                 rg_name = app.id.split('/')[4]
 
-                # Get app settings
+                # Fetch settings, connection strings, domains, slots IN PARALLEL for this app
+                with ThreadPoolExecutor(max_workers=4) as _ap:
+                    _f_settings = _ap.submit(lambda: web_client.web_apps.list_application_settings(rg_name, app.name))
+                    _f_conn     = _ap.submit(lambda: web_client.web_apps.list_connection_strings(rg_name, app.name))
+                    _f_domains  = _ap.submit(lambda: list(web_client.web_apps.list_host_name_bindings(rg_name, app.name)))
+                    _f_slots    = _ap.submit(lambda: list(web_client.web_apps.list_slots(rg_name, app.name)))
+
+                # Process settings
                 try:
-                    settings = web_client.web_apps.list_application_settings(rg_name, app.name)
+                    settings = _f_settings.result()
                     if settings and settings.properties:
                         for key, value in settings.properties.items():
-                            # Mask sensitive values
                             if any(s in key.lower() for s in ['password', 'secret', 'key', 'token']):
                                 app_info['app_settings'][key] = '***MASKED***'
                             else:
                                 app_info['app_settings'][key] = value
-                            
-                            # Detect external dependencies
                             if 'http://' in str(value) or 'https://' in str(value):
                                 app_info['external_dependencies'].append({
                                     'type': 'URL in app setting',
@@ -1044,21 +1165,19 @@ class AzureDiscovery:
                                 })
                 except Exception as e:
                     self.logger.warning(f"Could not get app settings for {app.name}: {e}")
-                
-                # Get connection strings
+
+                # Process connection strings
                 try:
-                    conn_strings = web_client.web_apps.list_connection_strings(rg_name, app.name)
+                    conn_strings = _f_conn.result()
                     if conn_strings and conn_strings.properties:
                         for key, value in conn_strings.properties.items():
-                            # Parse Azure service endpoint BEFORE masking the value
                             raw_val = str(value.value) if value.value else ''
                             azure_hint = _extract_azure_service_hint(raw_val)
                             app_info['connection_strings'][key] = {
                                 'type': value.type,
-                                'value': '***MASKED***',  # Never expose connection strings in output
-                                'azure_hint': azure_hint  # e.g. "ServiceBus:mynamespace"
+                                'value': '***MASKED***',
+                                'azure_hint': azure_hint
                             }
-
                             if value.type:
                                 app_info['external_dependencies'].append({
                                     'type': f'Connection String - {value.type}',
@@ -1066,11 +1185,10 @@ class AzureDiscovery:
                                 })
                 except Exception as e:
                     self.logger.warning(f"Could not get connection strings for {app.name}: {e}")
-                
-                # Get custom domains
+
+                # Process custom domains
                 try:
-                    domains = web_client.web_apps.list_host_name_bindings(rg_name, app.name)
-                    for domain in domains:
+                    for domain in _f_domains.result():
                         app_info['custom_domains'].append({
                             'name': domain.name,
                             'ssl_state': domain.ssl_state,
@@ -1078,11 +1196,10 @@ class AzureDiscovery:
                         })
                 except Exception as e:
                     self.logger.warning(f"Could not get custom domains for {app.name}: {e}")
-                
-                # Get deployment slots
+
+                # Process deployment slots
                 try:
-                    slots = web_client.web_apps.list_slots(rg_name, app.name)
-                    for slot in slots:
+                    for slot in _f_slots.result():
                         app_info['deployment_slots'].append({
                             'name': slot.name,
                             'state': slot.state,
@@ -1090,7 +1207,7 @@ class AzureDiscovery:
                         })
                 except Exception as e:
                     self.logger.warning(f"Could not get deployment slots for {app.name}: {e}")
-                
+
                 # Analyze IP restrictions for inbound traffic
                 if app.site_config:
                     if app.site_config.ip_security_restrictions:
@@ -1100,13 +1217,25 @@ class AzureDiscovery:
                                 'action': restriction.action if hasattr(restriction, 'action') else None,
                                 'name': restriction.name if hasattr(restriction, 'name') else None
                             })
-                
+
                 # Scan source code if enabled
                 if self.config['scan_code']:
                     self.scan_app_service_code(web_client, rg_name, app.name, app_info)
-                
-                sub_data['app_services'].append(app_info)
-            
+
+                return app_info
+
+            # Process all apps in parallel (each app gets its own 4-call sub-pool above)
+            _app_max_w = max(4, self.config.get('parallel_workers', 8))
+            app_results = []
+            with ThreadPoolExecutor(max_workers=_app_max_w) as _apps_pool:
+                _app_futs = {_apps_pool.submit(_process_single_app, app): app.name for app in apps}
+                for _fut in as_completed(_app_futs):
+                    try:
+                        app_results.append(_fut.result())
+                    except Exception as _e:
+                        self.logger.warning(f"Failed to process app {_app_futs[_fut]}: {_e}")
+
+            sub_data['app_services'].extend(app_results)
             self.logger.info(f"  ✓ Found {len(apps)} App Services")
             self.discovery_data['summary']['app_services'] += len(apps)
             
@@ -1140,12 +1269,14 @@ class AzureDiscovery:
         
         try:
             servers = list(sql_client.servers.list())
-            for server in servers:
+
+            def _fetch_server_details(server):
+                rg_name = server.id.split('/')[4]
                 server_info = {
                     'name': server.name,
                     'id': server.id,
                     'location': server.location,
-                    'resource_group': server.id.split('/')[4],
+                    'resource_group': rg_name,
                     'admin_login': server.administrator_login,
                     'version': server.version,
                     'fqdn': server.fully_qualified_domain_name,
@@ -1155,29 +1286,29 @@ class AzureDiscovery:
                     'private_endpoints': [],
                     'tags': server.tags or {}
                 }
-                
-                # Get databases
+
+                # Fetch databases, firewall rules and VNet rules in parallel
+                with ThreadPoolExecutor(max_workers=3) as _sp:
+                    _f_dbs   = _sp.submit(lambda: list(sql_client.databases.list_by_server(rg_name, server.name)))
+                    _f_fws   = _sp.submit(lambda: list(sql_client.firewall_rules.list_by_server(rg_name, server.name)))
+                    _f_vnet  = _sp.submit(lambda: list(sql_client.virtual_network_rules.list_by_server(rg_name, server.name)))
+
                 try:
-                    rg_name = server.id.split('/')[4]
-                    databases = sql_client.databases.list_by_server(rg_name, server.name)
-                    for db in databases:
-                        if db.name != 'master':  # Skip system database
-                            db_info = {
+                    for db in _f_dbs.result():
+                        if db.name != 'master':
+                            server_info['databases'].append({
                                 'name': db.name,
                                 'sku': db.sku.name if db.sku else None,
                                 'tier': db.sku.tier if db.sku else None,
                                 'max_size_bytes': db.max_size_bytes,
                                 'collation': db.collation,
                                 'zone_redundant': db.zone_redundant
-                            }
-                            server_info['databases'].append(db_info)
+                            })
                 except Exception as e:
                     self.logger.warning(f"Could not get databases for {server.name}: {e}")
-                
-                # Get firewall rules
+
                 try:
-                    fw_rules = sql_client.firewall_rules.list_by_server(rg_name, server.name)
-                    for rule in fw_rules:
+                    for rule in _f_fws.result():
                         server_info['firewall_rules'].append({
                             'name': rule.name,
                             'start_ip': rule.start_ip_address,
@@ -1185,11 +1316,9 @@ class AzureDiscovery:
                         })
                 except Exception as e:
                     self.logger.warning(f"Could not get firewall rules for {server.name}: {e}")
-                
-                # Get VNet rules (for service endpoints)
+
                 try:
-                    vnet_rules = sql_client.virtual_network_rules.list_by_server(rg_name, server.name)
-                    for rule in vnet_rules:
+                    for rule in _f_vnet.result():
                         server_info['vnet_rules'].append({
                             'name': rule.name,
                             'vnet_subnet': rule.virtual_network_subnet_id,
@@ -1197,8 +1326,18 @@ class AzureDiscovery:
                         })
                 except Exception as e:
                     self.logger.debug(f"Could not get VNet rules for {server.name}: {e}")
-                
-                sub_data['sql_servers'].append(server_info)
+
+                return server_info
+
+            # Fetch all servers in parallel
+            _sql_max_w = max(4, self.config.get('parallel_workers', 8))
+            with ThreadPoolExecutor(max_workers=_sql_max_w) as _sp_pool:
+                _sql_futs = {_sp_pool.submit(_fetch_server_details, srv): srv.name for srv in servers}
+                for _fut in as_completed(_sql_futs):
+                    try:
+                        sub_data['sql_servers'].append(_fut.result())
+                    except Exception as _e:
+                        self.logger.warning(f"Failed to process SQL server {_sql_futs[_fut]}: {_e}")
             
             self.logger.info(f"  ✓ Found {len(servers)} SQL Servers")
             self.discovery_data['summary']['sql_servers'] += len(servers)
@@ -1247,374 +1386,352 @@ class AzureDiscovery:
             self.logger.error(f"Error discovering storage accounts: {e}")
     
     def discover_paas_services(self, subscription_id, sub_data):
-        """Discover other PaaS services"""
+        """Discover other PaaS services — all service types run in parallel."""
         self.logger.info("Discovering PaaS services...")
-        
-        # Key Vault
-        try:
-            kv_client = KeyVaultManagementClient(self.credential, subscription_id)
-            vaults = list(kv_client.vaults.list())
-            for vault in vaults:
-                sub_data['key_vaults'].append({
-                    'name': vault.name,
-                    'id': vault.id,
-                    'location': vault.location,
-                    'resource_group': vault.id.split('/')[4],
-                    'vault_uri': vault.properties.vault_uri if vault.properties else None,
-                    'sku': vault.properties.sku.name if vault.properties and vault.properties.sku else None,
-                    'tenant_id': vault.properties.tenant_id if vault.properties else None
-                })
-            self.logger.info(f"  ✓ Found {len(vaults)} Key Vaults")
-            self.discovery_data['summary']['key_vaults'] += len(vaults)
-        except Exception as e:
-            self.logger.warning(f"Could not discover Key Vaults: {e}")
-        
-        # Cosmos DB
-        try:
-            cosmos_client = CosmosDBManagementClient(self.credential, subscription_id)
-            cosmos_accounts = list(cosmos_client.database_accounts.list())
-            for account in cosmos_accounts:
-                sub_data['cosmos_db'].append({
-                    'name': account.name,
-                    'id': account.id,
-                    'location': account.location,
-                    'resource_group': account.id.split('/')[4],
-                    'kind': account.kind,
-                    'consistency_policy': account.consistency_policy.default_consistency_level if account.consistency_policy else None,
-                    'locations': [loc.location_name for loc in account.locations] if account.locations else []
-                })
-            self.logger.info(f"  ✓ Found {len(cosmos_accounts)} Cosmos DB accounts")
-            self.discovery_data['summary']['cosmos_db'] += len(cosmos_accounts)
-        except Exception as e:
-            self.logger.warning(f"Could not discover Cosmos DB: {e}")
-        
-        # Redis Cache
-        try:
-            redis_client = RedisManagementClient(self.credential, subscription_id)
-            redis_caches = list(redis_client.redis.list())
-            for cache in redis_caches:
-                sub_data['redis_cache'].append({
-                    'name': cache.name,
-                    'id': cache.id,
-                    'location': cache.location,
-                    'resource_group': cache.id.split('/')[4],
-                    'sku': cache.sku.name if cache.sku else None,
-                    'redis_version': cache.redis_version,
-                    'port': cache.port,
-                    'ssl_port': cache.ssl_port
-                })
-            self.logger.info(f"  ✓ Found {len(redis_caches)} Redis Caches")
-            self.discovery_data['summary']['redis_cache'] += len(redis_caches)
-        except Exception as e:
-            self.logger.warning(f"Could not discover Redis Cache: {e}")
-        
-        # Service Bus
-        try:
-            sb_client = ServiceBusManagementClient(self.credential, subscription_id)
-            namespaces = list(sb_client.namespaces.list())
-            for ns in namespaces:
-                ns_info = {
-                    'name': ns.name,
-                    'id': ns.id,
-                    'location': ns.location,
-                    'resource_group': ns.id.split('/')[4],
-                    'sku': ns.sku.name if ns.sku else None,
-                    'queues': [],
-                    'topics': []
-                }
-                
-                # Get queues
-                try:
+        # Pass read-only policy to every SDK client created in this method
+        _kw = dict(per_call_policies=self._ro_policies) if self._ro_policies else {}
+
+        # ── Inner helpers — one per service type ──────────────────────────────
+        # Each helper is self-contained: create client → list → append to sub_data.
+        # They write to DIFFERENT sub_data keys so no locking is required.
+
+        def _disc_keyvault():
+            try:
+                kv_client = KeyVaultManagementClient(self.credential, subscription_id, **_kw)
+                vaults = list(kv_client.vaults.list())
+                for vault in vaults:
+                    sub_data['key_vaults'].append({
+                        'name': vault.name, 'id': vault.id, 'location': vault.location,
+                        'resource_group': vault.id.split('/')[4],
+                        'vault_uri': vault.properties.vault_uri if vault.properties else None,
+                        'sku': vault.properties.sku.name if vault.properties and vault.properties.sku else None,
+                        'tenant_id': vault.properties.tenant_id if vault.properties else None
+                    })
+                self.logger.info(f"  ✓ Found {len(vaults)} Key Vaults")
+                self.discovery_data['summary']['key_vaults'] += len(vaults)
+            except Exception as e:
+                self.logger.warning(f"Could not discover Key Vaults: {e}")
+
+        def _disc_cosmos():
+            try:
+                cosmos_client = CosmosDBManagementClient(self.credential, subscription_id, **_kw)
+                accounts = list(cosmos_client.database_accounts.list())
+                for a in accounts:
+                    sub_data['cosmos_db'].append({
+                        'name': a.name, 'id': a.id, 'location': a.location,
+                        'resource_group': a.id.split('/')[4], 'kind': a.kind,
+                        'consistency_policy': a.consistency_policy.default_consistency_level if a.consistency_policy else None,
+                        'locations': [loc.location_name for loc in a.locations] if a.locations else []
+                    })
+                self.logger.info(f"  ✓ Found {len(accounts)} Cosmos DB accounts")
+                self.discovery_data['summary']['cosmos_db'] += len(accounts)
+            except Exception as e:
+                self.logger.warning(f"Could not discover Cosmos DB: {e}")
+
+        def _disc_redis():
+            try:
+                redis_client = RedisManagementClient(self.credential, subscription_id, **_kw)
+                caches = list(redis_client.redis.list())
+                for c in caches:
+                    sub_data['redis_cache'].append({
+                        'name': c.name, 'id': c.id, 'location': c.location,
+                        'resource_group': c.id.split('/')[4],
+                        'sku': c.sku.name if c.sku else None,
+                        'redis_version': c.redis_version, 'port': c.port, 'ssl_port': c.ssl_port
+                    })
+                self.logger.info(f"  ✓ Found {len(caches)} Redis Caches")
+                self.discovery_data['summary']['redis_cache'] += len(caches)
+            except Exception as e:
+                self.logger.warning(f"Could not discover Redis Cache: {e}")
+
+        def _disc_servicebus():
+            try:
+                sb_client = ServiceBusManagementClient(self.credential, subscription_id, **_kw)
+                namespaces = list(sb_client.namespaces.list())
+                for ns in namespaces:
                     rg_name = ns.id.split('/')[4]
-                    queues = sb_client.queues.list_by_namespace(rg_name, ns.name)
-                    ns_info['queues'] = [q.name for q in queues]
-                except:
-                    pass
-                
-                # Get topics
+                    ns_info = {
+                        'name': ns.name, 'id': ns.id, 'location': ns.location,
+                        'resource_group': rg_name,
+                        'sku': ns.sku.name if ns.sku else None,
+                        'queues': [], 'topics': []
+                    }
+                    # Fetch queues + topics in parallel for this namespace
+                    with ThreadPoolExecutor(max_workers=2) as _sbp:
+                        _fq = _sbp.submit(lambda: [q.name for q in sb_client.queues.list_by_namespace(rg_name, ns.name)])
+                        _ft = _sbp.submit(lambda: [t.name for t in sb_client.topics.list_by_namespace(rg_name, ns.name)])
+                    try:
+                        ns_info['queues'] = _fq.result()
+                    except Exception:
+                        pass
+                    try:
+                        ns_info['topics'] = _ft.result()
+                    except Exception:
+                        pass
+                    sub_data['service_bus'].append(ns_info)
+                self.logger.info(f"  ✓ Found {len(namespaces)} Service Bus namespaces")
+                self.discovery_data['summary']['service_bus'] += len(namespaces)
+            except Exception as e:
+                self.logger.warning(f"Could not discover Service Bus: {e}")
+
+        def _disc_eventhub():
+            try:
+                eh_client = EventHubManagementClient(self.credential, subscription_id, **_kw)
+                nss = list(eh_client.namespaces.list())
+                for ns in nss:
+                    sub_data['event_hubs'].append({
+                        'name': ns.name, 'id': ns.id, 'location': ns.location,
+                        'resource_group': ns.id.split('/')[4],
+                        'sku': ns.sku.name if ns.sku else None
+                    })
+                self.logger.info(f"  ✓ Found {len(nss)} Event Hub namespaces")
+                self.discovery_data['summary']['event_hubs'] += len(nss)
+            except Exception as e:
+                self.logger.warning(f"Could not discover Event Hubs: {e}")
+
+        def _disc_appinsights():
+            try:
+                ai_client = ApplicationInsightsManagementClient(self.credential, subscription_id, **_kw)
+                components = list(ai_client.components.list())
+                for c in components:
+                    sub_data['app_insights'].append({
+                        'name': c.name, 'id': c.id, 'location': c.location,
+                        'resource_group': c.id.split('/')[4],
+                        'application_type': c.application_type,
+                        'instrumentation_key': '***MASKED***'
+                    })
+                self.logger.info(f"  ✓ Found {len(components)} Application Insights")
+                self.discovery_data['summary']['app_insights'] += len(components)
+            except Exception as e:
+                self.logger.warning(f"Could not discover Application Insights: {e}")
+
+        def _disc_acr():
+            try:
+                acr_client = ContainerRegistryManagementClient(self.credential, subscription_id, **_kw)
+                registries = list(acr_client.registries.list())
+                for r in registries:
+                    sub_data['container_registries'].append({
+                        'name': r.name, 'id': r.id, 'location': r.location,
+                        'resource_group': r.id.split('/')[4],
+                        'sku': r.sku.name if r.sku else None,
+                        'login_server': r.login_server, 'admin_enabled': r.admin_user_enabled
+                    })
+                self.logger.info(f"  ✓ Found {len(registries)} Container Registries")
+                self.discovery_data['summary']['container_registries'] += len(registries)
+            except Exception as e:
+                self.logger.warning(f"Could not discover Container Registries: {e}")
+
+        def _disc_aks():
+            try:
+                aks_client = ContainerServiceClient(self.credential, subscription_id, **_kw)
+                clusters = list(aks_client.managed_clusters.list())
+                for cluster in clusters:
+                    ci = {
+                        'name': cluster.name, 'id': cluster.id, 'location': cluster.location,
+                        'resource_group': cluster.id.split('/')[4],
+                        'kubernetes_version': cluster.kubernetes_version, 'fqdn': cluster.fqdn,
+                        'node_pools': [p.name for p in cluster.agent_pool_profiles] if cluster.agent_pool_profiles else [],
+                        'vnet': None, 'subnet': None, 'container_registry': None
+                    }
+                    if cluster.network_profile and cluster.network_profile.vnet_subnet_id:
+                        parts = cluster.network_profile.vnet_subnet_id.split('/')
+                        if len(parts) >= 11:
+                            ci['vnet'] = parts[8]
+                            ci['subnet'] = parts[10]
+                    sub_data['aks_clusters'].append(ci)
+                self.logger.info(f"  ✓ Found {len(clusters)} AKS Clusters")
+                self.discovery_data['summary']['aks_clusters'] += len(clusters)
+            except Exception as e:
+                self.logger.warning(f"Could not discover AKS: {e}")
+
+        def _disc_dns():
+            try:
+                dns_client = DnsManagementClient(self.credential, subscription_id, **_kw)
+                zones = list(dns_client.zones.list())
+                for z in zones:
+                    sub_data['dns_zones'].append({
+                        'name': z.name, 'id': z.id,
+                        'location': getattr(z, 'location', 'global'),
+                        'resource_group': z.id.split('/')[4],
+                        'number_of_record_sets': getattr(z, 'number_of_record_sets', 0)
+                    })
+                self.logger.info(f"  ✓ Found {len(zones)} DNS Zones")
+                self.discovery_data['summary']['dns_zones'] += len(zones)
+            except Exception as e:
+                self.logger.warning(f"Could not discover DNS Zones: {e}")
+
+        def _disc_trafficmanager():
+            try:
+                tm_client = TrafficManagerManagementClient(self.credential, subscription_id, **_kw)
+                profiles = list(tm_client.profiles.list_by_subscription())
+                for p in profiles:
+                    sub_data['traffic_managers'].append({
+                        'name': p.name, 'id': p.id,
+                        'location': getattr(p, 'location', 'global'),
+                        'resource_group': p.id.split('/')[4],
+                        'dns_name': p.dns_config.relative_name if p.dns_config else None,
+                        'routing_method': getattr(p, 'traffic_routing_method', None)
+                    })
+                self.logger.info(f"  ✓ Found {len(profiles)} Traffic Manager Profiles")
+                self.discovery_data['summary']['traffic_managers'] += len(profiles)
+            except Exception as e:
+                self.logger.warning(f"Could not discover Traffic Manager: {e}")
+
+        def _disc_cdn():
+            try:
+                cdn_client = CdnManagementClient(self.credential, subscription_id, **_kw)
+                cdn_profiles = list(cdn_client.profiles.list())
+                for p in cdn_profiles:
+                    sub_data['cdns'].append({
+                        'name': p.name, 'id': p.id, 'location': p.location,
+                        'resource_group': p.id.split('/')[4],
+                        'sku': p.sku.name if p.sku else None
+                    })
+                self.logger.info(f"  ✓ Found {len(cdn_profiles)} CDN Profiles")
+                self.discovery_data['summary']['cdns'] += len(cdn_profiles)
+            except Exception as e:
+                self.logger.warning(f"Could not discover CDN: {e}")
+
+        def _disc_frontdoor():
+            try:
+                fd_client = FrontDoorManagementClient(self.credential, subscription_id, **_kw)
+                frontdoors = list(fd_client.front_doors.list())
+                for fd in frontdoors:
+                    sub_data['frontdoors'].append({
+                        'name': fd.name, 'id': fd.id,
+                        'location': getattr(fd, 'location', 'global'),
+                        'resource_group': fd.id.split('/')[4],
+                        'frontend_endpoints': len(fd.frontend_endpoints) if getattr(fd, 'frontend_endpoints', None) else 0
+                    })
+                self.logger.info(f"  ✓ Found {len(frontdoors)} Front Doors")
+                self.discovery_data['summary']['frontdoors'] += len(frontdoors)
+            except Exception as e:
+                self.logger.warning(f"Could not discover Front Door: {e}")
+
+        def _disc_cognitive():
+            try:
+                cog_client = CognitiveServicesManagementClient(self.credential, subscription_id, **_kw)
+                accounts = list(cog_client.accounts.list())
+                for a in accounts:
+                    sub_data['cognitive_services'].append({
+                        'name': a.name, 'id': a.id, 'location': a.location,
+                        'resource_group': a.id.split('/')[4],
+                        'kind': a.kind, 'sku': a.sku.name if a.sku else None
+                    })
+                self.logger.info(f"  ✓ Found {len(accounts)} Cognitive Services")
+                self.discovery_data['summary']['cognitive_services'] += len(accounts)
+            except Exception as e:
+                self.logger.warning(f"Could not discover Cognitive Services: {e}")
+
+        def _disc_search():
+            try:
+                search_client = SearchManagementClient(self.credential, subscription_id, **_kw)
+                services = list(search_client.services.list_by_subscription())
+                for s in services:
+                    sub_data['search_services'].append({
+                        'name': s.name, 'id': s.id, 'location': s.location,
+                        'resource_group': s.id.split('/')[4],
+                        'sku': s.sku.name if s.sku else None,
+                        'replica_count': getattr(s, 'replica_count', None)
+                    })
+                self.logger.info(f"  ✓ Found {len(services)} Search Services")
+                self.discovery_data['summary']['search_services'] += len(services)
+            except Exception as e:
+                self.logger.warning(f"Could not discover Search Services: {e}")
+
+        def _disc_datafactory():
+            try:
+                df_client = DataFactoryManagementClient(self.credential, subscription_id, **_kw)
+                factories = list(df_client.factories.list())
+                for f in factories:
+                    sub_data['data_factories'].append({
+                        'name': f.name, 'id': f.id, 'location': f.location,
+                        'resource_group': f.id.split('/')[4],
+                        'provisioning_state': getattr(f, 'provisioning_state', None)
+                    })
+                self.logger.info(f"  ✓ Found {len(factories)} Data Factories")
+                self.discovery_data['summary']['data_factories'] += len(factories)
+            except Exception as e:
+                self.logger.warning(f"Could not discover Data Factory: {e}")
+
+        def _disc_databricks():
+            try:
+                dbr_client = AzureDatabricksManagementClient(self.credential, subscription_id, **_kw)
+                workspaces = list(dbr_client.workspaces.list_by_subscription())
+                for w in workspaces:
+                    sub_data['databricks'].append({
+                        'name': w.name, 'id': w.id, 'location': w.location,
+                        'resource_group': w.id.split('/')[4],
+                        'sku': w.sku.name if w.sku else None,
+                        'workspace_url': getattr(w, 'workspace_url', None)
+                    })
+                self.logger.info(f"  ✓ Found {len(workspaces)} Databricks Workspaces")
+                self.discovery_data['summary']['databricks'] += len(workspaces)
+            except Exception as e:
+                self.logger.warning(f"Could not discover Databricks: {e}")
+
+        def _disc_loganalytics():
+            try:
+                la_client = LogAnalyticsManagementClient(self.credential, subscription_id, **_kw)
+                workspaces = list(la_client.workspaces.list())
+                for w in workspaces:
+                    sub_data['log_analytics'].append({
+                        'name': w.name, 'id': w.id, 'location': w.location,
+                        'resource_group': w.id.split('/')[4],
+                        'sku': w.sku.name if w.sku else None,
+                        'retention_days': getattr(w, 'retention_in_days', None)
+                    })
+                self.logger.info(f"  ✓ Found {len(workspaces)} Log Analytics Workspaces")
+                self.discovery_data['summary']['log_analytics'] += len(workspaces)
+            except Exception as e:
+                self.logger.warning(f"Could not discover Log Analytics: {e}")
+
+        def _disc_notificationhubs():
+            try:
+                nh_client = NotificationHubsManagementClient(self.credential, subscription_id, **_kw)
+                nss = list(nh_client.namespaces.list())
+                for ns in nss:
+                    sub_data['notification_hubs'].append({
+                        'name': ns.name, 'id': ns.id, 'location': ns.location,
+                        'resource_group': ns.id.split('/')[4],
+                        'sku': ns.sku.name if ns.sku else None
+                    })
+                self.logger.info(f"  ✓ Found {len(nss)} Notification Hub Namespaces")
+                self.discovery_data['summary']['notification_hubs'] += len(nss)
+            except Exception as e:
+                self.logger.warning(f"Could not discover Notification Hubs: {e}")
+
+        # ── Run ALL service discoveries in parallel ────────────────────────────
+        _paas_tasks = {
+            'key_vault':        _disc_keyvault,
+            'cosmos_db':        _disc_cosmos,
+            'redis_cache':      _disc_redis,
+            'service_bus':      _disc_servicebus,
+            'event_hubs':       _disc_eventhub,
+            'app_insights':     _disc_appinsights,
+            'acr':              _disc_acr,
+            'aks':              _disc_aks,
+            'dns':              _disc_dns,
+            'traffic_manager':  _disc_trafficmanager,
+            'cdn':              _disc_cdn,
+            'front_door':       _disc_frontdoor,
+            'cognitive':        _disc_cognitive,
+            'search':           _disc_search,
+            'data_factory':     _disc_datafactory,
+            'databricks':       _disc_databricks,
+            'log_analytics':    _disc_loganalytics,
+            'notification_hubs': _disc_notificationhubs,
+        }
+        with ThreadPoolExecutor(max_workers=len(_paas_tasks)) as _paas_pool:
+            _paas_futs = {_paas_pool.submit(fn): name for name, fn in _paas_tasks.items()}
+            for _fut in as_completed(_paas_futs):
                 try:
-                    topics = sb_client.topics.list_by_namespace(rg_name, ns.name)
-                    ns_info['topics'] = [t.name for t in topics]
-                except:
-                    pass
-                
-                sub_data['service_bus'].append(ns_info)
-            
-            self.logger.info(f"  ✓ Found {len(namespaces)} Service Bus namespaces")
-            self.discovery_data['summary']['service_bus'] += len(namespaces)
-        except Exception as e:
-            self.logger.warning(f"Could not discover Service Bus: {e}")
-        
-        # Event Hubs
-        try:
-            eh_client = EventHubManagementClient(self.credential, subscription_id)
-            eh_namespaces = list(eh_client.namespaces.list())
-            for ns in eh_namespaces:
-                sub_data['event_hubs'].append({
-                    'name': ns.name,
-                    'id': ns.id,
-                    'location': ns.location,
-                    'resource_group': ns.id.split('/')[4],
-                    'sku': ns.sku.name if ns.sku else None
-                })
-            self.logger.info(f"  ✓ Found {len(eh_namespaces)} Event Hub namespaces")
-            self.discovery_data['summary']['event_hubs'] += len(eh_namespaces)
-        except Exception as e:
-            self.logger.warning(f"Could not discover Event Hubs: {e}")
-        
-        # Application Insights
-        try:
-            ai_client = ApplicationInsightsManagementClient(self.credential, subscription_id)
-            components = list(ai_client.components.list())
-            for component in components:
-                sub_data['app_insights'].append({
-                    'name': component.name,
-                    'id': component.id,
-                    'location': component.location,
-                    'resource_group': component.id.split('/')[4],
-                    'application_type': component.application_type,
-                    'instrumentation_key': '***MASKED***'
-                })
-            self.logger.info(f"  ✓ Found {len(components)} Application Insights")
-            self.discovery_data['summary']['app_insights'] += len(components)
-        except Exception as e:
-            self.logger.warning(f"Could not discover Application Insights: {e}")
-        
-        # Container Registries
-        try:
-            acr_client = ContainerRegistryManagementClient(self.credential, subscription_id)
-            registries = list(acr_client.registries.list())
-            for registry in registries:
-                sub_data['container_registries'].append({
-                    'name': registry.name,
-                    'id': registry.id,
-                    'location': registry.location,
-                    'resource_group': registry.id.split('/')[4],
-                    'sku': registry.sku.name if registry.sku else None,
-                    'login_server': registry.login_server,
-                    'admin_enabled': registry.admin_user_enabled
-                })
-            self.logger.info(f"  ✓ Found {len(registries)} Container Registries")
-            self.discovery_data['summary']['container_registries'] += len(registries)
-        except Exception as e:
-            self.logger.warning(f"Could not discover Container Registries: {e}")
-        
-        # AKS Clusters
-        try:
-            aks_client = ContainerServiceClient(self.credential, subscription_id)
-            clusters = list(aks_client.managed_clusters.list())
-            for cluster in clusters:
-                cluster_info = {
-                    'name': cluster.name,
-                    'id': cluster.id,
-                    'location': cluster.location,
-                    'resource_group': cluster.id.split('/')[4],
-                    'kubernetes_version': cluster.kubernetes_version,
-                    'fqdn': cluster.fqdn,
-                    'node_pools': [pool.name for pool in cluster.agent_pool_profiles] if cluster.agent_pool_profiles else [],
-                    'vnet': None,
-                    'subnet': None,
-                    'container_registry': None
-                }
-                
-                # Extract VNet information from network profile
-                if cluster.network_profile and cluster.network_profile.vnet_subnet_id:
-                    vnet_subnet_id = cluster.network_profile.vnet_subnet_id
-                    # Parse: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Network/virtualNetworks/{vnet}/subnets/{subnet}
-                    parts = vnet_subnet_id.split('/')
-                    if len(parts) >= 11:
-                        cluster_info['vnet'] = parts[8]
-                        cluster_info['subnet'] = parts[10]
-                
-                # Extract container registry from properties (if using managed identity)
-                # This is a simplified check - actual ACR integration can be more complex
-                if hasattr(cluster, 'addon_profiles') and cluster.addon_profiles:
-                    # Check for ACR addon
-                    pass  # ACR integration is typically through RBAC, not directly visible here
-                
-                sub_data['aks_clusters'].append(cluster_info)
-            self.logger.info(f"  ✓ Found {len(clusters)} AKS Clusters")
-            self.discovery_data['summary']['aks_clusters'] += len(clusters)
-        except Exception as e:
-            self.logger.warning(f"Could not discover AKS: {e}")
-        
-        # DNS Zones
-        try:
-            dns_client = DnsManagementClient(self.credential, subscription_id)
-            dns_zones = list(dns_client.zones.list())
-            for zone in dns_zones:
-                sub_data['dns_zones'].append({
-                    'name': zone.name,
-                    'id': zone.id,
-                    'location': zone.location if hasattr(zone, 'location') else 'global',
-                    'resource_group': zone.id.split('/')[4],
-                    'number_of_record_sets': zone.number_of_record_sets if hasattr(zone, 'number_of_record_sets') else 0
-                })
-            self.logger.info(f"  ✓ Found {len(dns_zones)} DNS Zones")
-            self.discovery_data['summary']['dns_zones'] += len(dns_zones)
-        except Exception as e:
-            self.logger.warning(f"Could not discover DNS Zones: {e}")
-        
-        # Traffic Manager
-        try:
-            tm_client = TrafficManagerManagementClient(self.credential, subscription_id)
-            profiles = list(tm_client.profiles.list_by_subscription())
-            for profile in profiles:
-                sub_data['traffic_managers'].append({
-                    'name': profile.name,
-                    'id': profile.id,
-                    'location': profile.location if hasattr(profile, 'location') else 'global',
-                    'resource_group': profile.id.split('/')[4],
-                    'dns_name': profile.dns_config.relative_name if profile.dns_config else None,
-                    'routing_method': profile.traffic_routing_method if hasattr(profile, 'traffic_routing_method') else None
-                })
-            self.logger.info(f"  ✓ Found {len(profiles)} Traffic Manager Profiles")
-            self.discovery_data['summary']['traffic_managers'] += len(profiles)
-        except Exception as e:
-            self.logger.warning(f"Could not discover Traffic Manager: {e}")
-        
-        # CDN
-        try:
-            cdn_client = CdnManagementClient(self.credential, subscription_id)
-            cdn_profiles = list(cdn_client.profiles.list())
-            for profile in cdn_profiles:
-                sub_data['cdns'].append({
-                    'name': profile.name,
-                    'id': profile.id,
-                    'location': profile.location,
-                    'resource_group': profile.id.split('/')[4],
-                    'sku': profile.sku.name if profile.sku else None
-                })
-            self.logger.info(f"  ✓ Found {len(cdn_profiles)} CDN Profiles")
-            self.discovery_data['summary']['cdns'] += len(cdn_profiles)
-        except Exception as e:
-            self.logger.warning(f"Could not discover CDN: {e}")
-        
-        # Front Door
-        try:
-            fd_client = FrontDoorManagementClient(self.credential, subscription_id)
-            frontdoors = list(fd_client.front_doors.list())
-            for fd in frontdoors:
-                sub_data['frontdoors'].append({
-                    'name': fd.name,
-                    'id': fd.id,
-                    'location': fd.location if hasattr(fd, 'location') else 'global',
-                    'resource_group': fd.id.split('/')[4],
-                    'frontend_endpoints': len(fd.frontend_endpoints) if hasattr(fd, 'frontend_endpoints') and fd.frontend_endpoints else 0
-                })
-            self.logger.info(f"  ✓ Found {len(frontdoors)} Front Doors")
-            self.discovery_data['summary']['frontdoors'] += len(frontdoors)
-        except Exception as e:
-            self.logger.warning(f"Could not discover Front Door: {e}")
-        
-        # Cognitive Services
-        try:
-            cognitive_client = CognitiveServicesManagementClient(self.credential, subscription_id)
-            cognitive_accounts = list(cognitive_client.accounts.list())
-            for account in cognitive_accounts:
-                sub_data['cognitive_services'].append({
-                    'name': account.name,
-                    'id': account.id,
-                    'location': account.location,
-                    'resource_group': account.id.split('/')[4],
-                    'kind': account.kind,
-                    'sku': account.sku.name if account.sku else None
-                })
-            self.logger.info(f"  ✓ Found {len(cognitive_accounts)} Cognitive Services")
-            self.discovery_data['summary']['cognitive_services'] += len(cognitive_accounts)
-        except Exception as e:
-            self.logger.warning(f"Could not discover Cognitive Services: {e}")
-        
-        # Search Services
-        try:
-            search_client = SearchManagementClient(self.credential, subscription_id)
-            search_services = list(search_client.services.list_by_subscription())
-            for service in search_services:
-                sub_data['search_services'].append({
-                    'name': service.name,
-                    'id': service.id,
-                    'location': service.location,
-                    'resource_group': service.id.split('/')[4],
-                    'sku': service.sku.name if service.sku else None,
-                    'replica_count': service.replica_count if hasattr(service, 'replica_count') else None
-                })
-            self.logger.info(f"  ✓ Found {len(search_services)} Search Services")
-            self.discovery_data['summary']['search_services'] += len(search_services)
-        except Exception as e:
-            self.logger.warning(f"Could not discover Search Services: {e}")
-        
-        # Data Factory
-        try:
-            df_client = DataFactoryManagementClient(self.credential, subscription_id)
-            factories = list(df_client.factories.list())
-            for factory in factories:
-                sub_data['data_factories'].append({
-                    'name': factory.name,
-                    'id': factory.id,
-                    'location': factory.location,
-                    'resource_group': factory.id.split('/')[4],
-                    'provisioning_state': factory.provisioning_state if hasattr(factory, 'provisioning_state') else None
-                })
-            self.logger.info(f"  ✓ Found {len(factories)} Data Factories")
-            self.discovery_data['summary']['data_factories'] += len(factories)
-        except Exception as e:
-            self.logger.warning(f"Could not discover Data Factory: {e}")
-        
-        # Databricks
-        try:
-            databricks_client = AzureDatabricksManagementClient(self.credential, subscription_id)
-            workspaces = list(databricks_client.workspaces.list_by_subscription())
-            for workspace in workspaces:
-                sub_data['databricks'].append({
-                    'name': workspace.name,
-                    'id': workspace.id,
-                    'location': workspace.location,
-                    'resource_group': workspace.id.split('/')[4],
-                    'sku': workspace.sku.name if workspace.sku else None,
-                    'workspace_url': workspace.workspace_url if hasattr(workspace, 'workspace_url') else None
-                })
-            self.logger.info(f"  ✓ Found {len(workspaces)} Databricks Workspaces")
-            self.discovery_data['summary']['databricks'] += len(workspaces)
-        except Exception as e:
-            self.logger.warning(f"Could not discover Databricks: {e}")
-        
-        # Log Analytics
-        try:
-            la_client = LogAnalyticsManagementClient(self.credential, subscription_id)
-            workspaces = list(la_client.workspaces.list())
-            for workspace in workspaces:
-                sub_data['log_analytics'].append({
-                    'name': workspace.name,
-                    'id': workspace.id,
-                    'location': workspace.location,
-                    'resource_group': workspace.id.split('/')[4],
-                    'sku': workspace.sku.name if workspace.sku else None,
-                    'retention_days': workspace.retention_in_days if hasattr(workspace, 'retention_in_days') else None
-                })
-            self.logger.info(f"  ✓ Found {len(workspaces)} Log Analytics Workspaces")
-            self.discovery_data['summary']['log_analytics'] += len(workspaces)
-        except Exception as e:
-            self.logger.warning(f"Could not discover Log Analytics: {e}")
-        
-        # Notification Hubs
-        try:
-            nh_client = NotificationHubsManagementClient(self.credential, subscription_id)
-            namespaces = list(nh_client.namespaces.list())
-            for ns in namespaces:
-                sub_data['notification_hubs'].append({
-                    'name': ns.name,
-                    'id': ns.id,
-                    'location': ns.location,
-                    'resource_group': ns.id.split('/')[4],
-                    'sku': ns.sku.name if ns.sku else None
-                })
-            self.logger.info(f"  ✓ Found {len(namespaces)} Notification Hub Namespaces")
-            self.discovery_data['summary']['notification_hubs'] += len(namespaces)
-        except Exception as e:
-            self.logger.warning(f"Could not discover Notification Hubs: {e}")
-        
+                    _fut.result()
+                except Exception as _e:
+                    self.logger.error(f"Unexpected error in PaaS discovery ({_paas_futs[_fut]}): {_e}")
+
         self.logger.info("✓ PaaS services discovery complete")
-    
+
     def analyze_dependencies(self):
         """Analyze and map dependencies between resources.
         
@@ -2272,14 +2389,17 @@ class AzureDiscovery:
 
         temp_dir = os.path.join(self.config['output_dir'], 'temp_repos')
         os.makedirs(temp_dir, exist_ok=True)
-        scanned = 0
-        failed  = 0
 
-        for idx, repo_config in enumerate(repos, 1):
+        total = len(repos)
+        _failed_lock = threading.Lock()
+        scanned_count = [0]
+        failed_count  = [0]
+
+        def _scan_single_repo(idx, repo_config):
+            """Clone + scan one repository. Returns True on success."""
             repo_url    = repo_config['url']    if isinstance(repo_config, dict) else repo_config
             repo_branch = repo_config.get('branch') if isinstance(repo_config, dict) else None
 
-            # Mask PAT/password in display URL
             try:
                 parsed   = urllib.parse.urlparse(repo_url)
                 safe_url = repo_url.replace(parsed.password or '', '***') if parsed.password else repo_url
@@ -2287,7 +2407,7 @@ class AzureDiscovery:
                 safe_url = repo_url
 
             branch_info = f" (branch: {repo_branch})" if repo_branch else " (default branch)"
-            self.logger.info(f"\n  [{idx}/{len(repos)}] {safe_url}{branch_info}")
+            self.logger.info(f"\n  [{idx}/{total}] {safe_url}{branch_info}")
 
             repo_name = repo_url.rstrip('/').split('/')[-1].replace('.git', '')
             repo_path = os.path.join(temp_dir, repo_name)
@@ -2297,7 +2417,7 @@ class AzureDiscovery:
             try:
                 ls_env = os.environ.copy()
                 ls_env['GIT_SSL_NO_VERIFY'] = '1'
-                ls_env['GIT_TERMINAL_PROMPT'] = '0'  # never hang waiting for password
+                ls_env['GIT_TERMINAL_PROMPT'] = '0'
                 ls_result = subprocess.run(
                     ['git', 'ls-remote', '--heads', repo_url],
                     capture_output=True, text=True, timeout=30, env=ls_env
@@ -2321,12 +2441,10 @@ class AzureDiscovery:
                         self.logger.error(f"      Fix: Azure DevOps -> User Settings -> Personal Access Tokens")
                         self.logger.error(f"           Create/renew PAT with scope: Code (Read)")
                         self.logger.error(f"           Update pat_token in config.json")
-                        failed += 1
-                        continue
+                        return False
                     elif '404' in err or 'not found' in err.lower() or 'does not exist' in err.lower():
                         self.logger.error(f"      Fix: Check organization / project_name / repository name in config.json")
-                        failed += 1
-                        continue
+                        return False
                     # else: non-fatal warning, still try the clone
             except subprocess.TimeoutExpired:
                 self.logger.warning(f"      ls-remote timed out (30s) - network may be slow or blocked")
@@ -2335,80 +2453,65 @@ class AzureDiscovery:
             except Exception as ls_err:
                 self.logger.warning(f"      Preflight check skipped: {ls_err}")
 
-            # ── Step 1: Clone / pull repo first ───────────────────────────────
-            clone_ok = False
+            # ── Step 1: Clone / pull repo ─────────────────────────────────────
             try:
                 self._clone_repo_with_ssl_fallback(repo_url, repo_path, repo_branch)
-                clone_ok = True
                 self.logger.info(f"      Repository ready at: {repo_path}")
             except git.exc.GitCommandError as git_err:
                 err_str = str(git_err)
                 sep = '='*64
-                self.logger.error(f"")
-                self.logger.error(f"  {sep}")
-                self.logger.error(f"  CLONE FAILED : {safe_url}")
-                self.logger.error(f"  {sep}")
+                self.logger.error(f"\n  {sep}\n  CLONE FAILED : {safe_url}\n  {sep}")
                 if '401' in err_str or '403' in err_str or 'authentication' in err_str.lower() or 'credential' in err_str.lower():
                     self.logger.error(f"  ERROR TYPE   : Authentication / Authorization failure (HTTP 401/403)")
-                    self.logger.error(f"  WHAT HAPPENED: Git rejected the credentials embedded in the URL.")
-                    self.logger.error(f"  HOW TO FIX   :")
-                    self.logger.error(f"    1. Go to Azure DevOps -> User Settings -> Personal Access Tokens")
-                    self.logger.error(f"    2. Create or renew a PAT with scope: Code (Read)")
-                    self.logger.error(f"    3. In config.json set  azure_devops.pat_token  to the new token value")
-                    self.logger.error(f"    4. Confirm azure_devops.organization matches your DevOps org name exactly")
-                elif '404' in err_str or 'not found' in err_str.lower() or 'repository not found' in err_str.lower() or 'does not exist' in err_str.lower():
+                    self.logger.error(f"  HOW TO FIX   : Renew PAT (Code Read) and update pat_token in config.json")
+                elif '404' in err_str or 'not found' in err_str.lower() or 'does not exist' in err_str.lower():
                     self.logger.error(f"  ERROR TYPE   : Repository / path not found (HTTP 404)")
-                    self.logger.error(f"  WHAT HAPPENED: The URL does not resolve to an existing repository.")
-                    self.logger.error(f"  HOW TO FIX   :")
-                    self.logger.error(f"    1. In config.json verify  azure_devops.organization  (exact spelling)")
-                    self.logger.error(f"    2. Verify  projects[].project_name  (exact spelling, case-sensitive)")
-                    self.logger.error(f"    3. Verify  repositories[].name      (exact spelling)")
-                    self.logger.error(f"    4. Confirm the repo exists at: Azure DevOps -> Repos")
-                elif 'ssl' in err_str.lower() or 'certificate' in err_str.lower() or 'cert' in err_str.lower():
-                    self.logger.error(f"  ERROR TYPE   : SSL / TLS certificate verification error")
-                    self.logger.error(f"  WHAT HAPPENED: Git cannot verify the server's TLS certificate.")
-                    self.logger.error(f"  HOW TO FIX   :")
-                    self.logger.error(f"    Run:  git config --global http.sslBackend schannel   (recommended on Windows)")
-                    self.logger.error(f"    OR :  git config --global http.sslVerify false        (insecure fallback)")
+                    self.logger.error(f"  HOW TO FIX   : Verify organization / project_name / repository in config.json")
+                elif 'ssl' in err_str.lower() or 'certificate' in err_str.lower():
+                    self.logger.error(f"  ERROR TYPE   : SSL / TLS certificate error")
+                    self.logger.error(f"  HOW TO FIX   : git config --global http.sslBackend schannel")
                 elif 'timeout' in err_str.lower() or 'timed out' in err_str.lower():
-                    self.logger.error(f"  ERROR TYPE   : Network / connection timeout")
-                    self.logger.error(f"  WHAT HAPPENED: Git could not reach the server within the timeout limit.")
-                    self.logger.error(f"  HOW TO FIX   :")
-                    self.logger.error(f"    1. Check internet connectivity and corporate VPN / proxy settings")
-                    self.logger.error(f"    2. Test manually: git ls-remote {safe_url}")
+                    self.logger.error(f"  ERROR TYPE   : Network timeout")
+                    self.logger.error(f"  HOW TO FIX   : Check internet / VPN, then: git ls-remote {safe_url}")
                 else:
-                    self.logger.error(f"  ERROR TYPE   : Unexpected git error")
-                    self.logger.error(f"  DETAILS      : {err_str[:500]}")
-                    self.logger.error(f"  HOW TO FIX   :")
-                    self.logger.error(f"    Test manually: git clone {safe_url}")
-                    self.logger.error(f"    Ensure 'git' is installed and available in PATH")
-                self.logger.error(f"  {sep}")
-                self.logger.error(f"  Skipping code scan for this repository.")
-                self.logger.error(f"  {sep}")
-                failed += 1
-                continue
-            except Exception as clone_generic_err:
+                    self.logger.error(f"  ERROR TYPE   : Unexpected git error\n  DETAILS      : {err_str[:500]}")
+                self.logger.error(f"  {sep}\n  Skipping code scan for this repository.\n  {sep}")
+                return False
+            except Exception as clone_err:
                 sep = '='*64
-                self.logger.error(f"")
-                self.logger.error(f"  {sep}")
-                self.logger.error(f"  CLONE FAILED : {safe_url}")
-                self.logger.error(f"  REASON       : {str(clone_generic_err)[:500]}")
-                self.logger.error(f"  Ensure 'git' is installed and the URL is reachable.")
-                self.logger.error(f"  {sep}")
-                failed += 1
-                continue
+                self.logger.error(f"\n  {sep}\n  CLONE FAILED : {safe_url}\n  REASON       : {str(clone_err)[:500]}\n  {sep}")
+                return False
 
-            # ── Step 2: Scan code (only runs when clone succeeded) ────────────
+            # ── Step 2: Scan code ─────────────────────────────────────────────
             try:
                 self.logger.info(f"      Scanning repository line by line for Azure service dependencies...")
                 self.scan_repository_code(repo_path, repo_name)
-                scanned += 1
                 self.logger.info(f"      Done - {repo_name}")
+                return True
             except Exception as scan_err:
                 self.logger.error(f"      !! Code scan failed for {repo_name}: {scan_err}")
-                failed += 1
+                return False
 
-        self.logger.info(f"\n  Code scanning complete: {scanned} succeeded, {failed} failed out of {len(repos)} repo(s)")
+        # ── Run all repos in parallel (bounded by git_clone_workers) ──────────
+        git_workers = self.config.get('git_clone_workers', 3)
+        with ThreadPoolExecutor(max_workers=git_workers) as _git_pool:
+            _git_futs = {
+                _git_pool.submit(_scan_single_repo, idx, repo_config): idx
+                for idx, repo_config in enumerate(repos, 1)
+            }
+            for _fut in as_completed(_git_futs):
+                try:
+                    if _fut.result():
+                        scanned_count[0] += 1
+                    else:
+                        failed_count[0] += 1
+                except Exception as _e:
+                    self.logger.error(f"Unexpected error scanning repo {_git_futs[_fut]}: {_e}")
+                    failed_count[0] += 1
+
+        scanned = scanned_count[0]
+        failed  = failed_count[0]
+        self.logger.info(f"\n  Code scanning complete: {scanned} succeeded, {failed} failed out of {total} repo(s)")
     
     def scan_repository_code(self, repo_path, repo_name):
         """Scan repository code for Azure service dependencies and configurations.
@@ -2442,15 +2545,21 @@ class AzureDiscovery:
         self.logger.info(f"    Pass 1/3 - Scanning for ARM / Bicep templates...")
         arm_templates = self.scan_arm_templates(repo_path)
         app_data['arm_templates'] = arm_templates
-        self.discovery_data['arm_templates'].extend(arm_templates)
+        with self._scan_lock:
+            self.discovery_data['arm_templates'].extend(arm_templates)
         
         # Pass 2: .NET project files, appsettings, web.config
-        self.logger.info(f"    Pass 2/3 - Scanning .NET project / config files...")
+        self.logger.info(f"    Pass 2/4 - Scanning .NET project / config files...")
         dotnet_analysis = self.scan_dotnet_code(repo_path, repo_name)
         app_data.update(dotnet_analysis)
         
-        # Pass 3: Line-by-line scan of ALL file types
-        self.logger.info(f"    Pass 3/3 - Full repository line-by-line scan...")
+        # Pass 3: Multi-language dependency manifests
+        self.logger.info(f"    Pass 3/4 - Scanning dependency manifests (pip, npm, maven, go, ruby)...")
+        dep_manifests = self.scan_dependency_manifests(repo_path, repo_name)
+        app_data['dependency_manifests'] = dep_manifests
+
+        # Pass 4: Line-by-line scan of ALL file types
+        self.logger.info(f"    Pass 4/4 - Full repository line-by-line scan...")
         line_hits, files_count, lines_count = self.scan_repo_line_by_line(repo_path, repo_name)
         app_data['azure_service_hits'] = line_hits
         # Use max so we don't under-count when dotnet scan already walked some files
@@ -2479,6 +2588,8 @@ class AzureDiscovery:
         self.logger.info(f"    Scanned {app_data['files_scanned']} files, {app_data['lines_scanned']:,} lines")
         self.logger.info(f"    Found {len(arm_templates)} ARM/Bicep templates")
         self.logger.info(f"    Found {len(app_data['nuget_packages'])} NuGet packages")
+        total_pkg = sum(len(v) for v in dep_manifests.values()) if dep_manifests else 0
+        self.logger.info(f"    Found {total_pkg} dependency manifest entries across {len(dep_manifests)} manifest file(s)")
         self.logger.info(f"    Found {len(line_hits)} Azure service references in source code")
 
     def scan_repo_line_by_line(self, repo_path: str, repo_name: str):
@@ -2632,32 +2743,51 @@ class AzureDiscovery:
 
         return hits, files_scanned, lines_scanned
 
-        """Scan for and analyze ARM templates"""
+    def scan_arm_templates(self, repo_path):
+        """Scan for and analyze ARM / Bicep templates in a repository."""
         arm_templates = []
         
         for root, dirs, files in os.walk(repo_path):
-            if '.git' in root:
-                continue
-            
+            # Skip git internals and common non-source dirs
+            dirs[:] = [d for d in dirs if d not in ('.git', 'node_modules', 'bin', 'obj', '__pycache__')]
+
             for file in files:
-                # Look for ARM template files
-                if file.endswith('.json') and any(keyword in file.lower() for keyword in ['template', 'deploy', 'arm', 'azuredeploy']):
-                    file_path = os.path.join(root, file)
+                file_path = os.path.join(root, file)
+                # ── Bicep templates ──────────────────────────────────────────
+                if file.endswith('.bicep'):
                     try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            content = json.load(f)
-                            
-                            # Check if it's an ARM template
-                            if '$schema' in content and 'deploymentTemplate' in content.get('$schema', ''):
-                                template_info = self.parse_arm_template(content, file_path)
-                                if template_info:
-                                    arm_templates.append(template_info)
-                                    self.logger.info(f"      Found ARM template: {file}")
+                        with open(file_path, 'r', encoding='utf-8', errors='replace') as fh:
+                            content = fh.read()
+                        arm_templates.append({
+                            'file': os.path.relpath(file_path, repo_path).replace('\\', '/'),
+                            'path': file_path,
+                            'type': 'Bicep',
+                            'resources': re.findall(r"resource\s+\w+\s+'([^']+)'", content),
+                            'modules': re.findall(r"module\s+\w+\s+'([^']+)'", content),
+                            'params': re.findall(r"^param\s+(\w+)", content, re.M),
+                        })
+                        self.logger.info(f"      Found Bicep template: {file}")
+                    except Exception as e:
+                        self.logger.debug(f"Could not parse Bicep {file_path}: {e}")
+
+                # ── ARM JSON templates ───────────────────────────────────────
+                elif file.endswith('.json') and any(
+                    keyword in file.lower()
+                    for keyword in ['template', 'deploy', 'arm', 'azuredeploy', 'maintemplate']
+                ):
+                    try:
+                        with open(file_path, 'r', encoding='utf-8', errors='replace') as fh:
+                            content = json.load(fh)
+                        if '$schema' in content and 'deploymentTemplate' in content.get('$schema', ''):
+                            template_info = self.parse_arm_template(content, file_path)
+                            if template_info:
+                                arm_templates.append(template_info)
+                                self.logger.info(f"      Found ARM template: {file}")
                     except Exception as e:
                         self.logger.debug(f"Could not parse {file_path} as ARM template: {e}")
-        
+
         return arm_templates
-    
+
     def parse_arm_template(self, template, file_path):
         """Parse ARM template and extract resource definitions"""
         try:
@@ -2727,6 +2857,268 @@ class AzureDiscovery:
         
         return key_props
     
+    def scan_dependency_manifests(self, repo_path: str, repo_name: str) -> dict:
+        """Scan all common package/dependency manifest files in a repository.
+
+        Handles:
+        - Python  : requirements*.txt, setup.py, setup.cfg, pyproject.toml, Pipfile
+        - Node.js : package.json (direct + devDependencies)
+        - Java    : pom.xml (Maven), build.gradle / build.gradle.kts (Gradle)
+        - Go      : go.mod
+        - Ruby    : Gemfile
+        - .NET    : *.csproj, packages.config  (delegated to existing scanner)
+        - PHP     : composer.json
+        - Rust    : Cargo.toml
+
+        Returns a dict keyed by manifest file path (relative), each value is a list
+        of {"name": pkg, "version": ver, "type": "<ecosystem>", "file": rel_path}.
+        Packages / modules that contain Azure-related names are flagged with
+        "azure_related": True.
+        """
+        import xml.etree.ElementTree as ET
+
+        AZURE_PKG_KEYWORDS = (
+            'azure', '@azure/', 'microsoft.azure', 'com.microsoft.azure',
+            'com.azure', 'azure-', 'azure_', 'servicebus', 'cosmosdb',
+            'applicationinsights', 'eventhub', 'keyvault', 'blobstorage',
+        )
+
+        def _is_azure(name: str) -> bool:
+            n = name.lower()
+            return any(k in n for k in AZURE_PKG_KEYWORDS)
+
+        manifests: dict = {}   # {rel_path: [{"name":, "version":, "type":, ...}]}
+
+        SKIP_DIRS = {'.git', 'node_modules', 'bin', 'obj', '__pycache__',
+                     'dist', 'build', '.venv', 'venv', 'env', '.terraform',
+                     'vendor', 'packages', 'target', '.gradle'}
+
+        for root, dirs, files in os.walk(repo_path):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            rel_root = os.path.relpath(root, repo_path).replace('\\', '/')
+            if rel_root == '.':
+                rel_root = ''
+
+            for fname in files:
+                fpath     = os.path.join(root, fname)
+                rel_fpath = (f"{rel_root}/{fname}" if rel_root else fname)
+                pkgs: list = []
+
+                # ── Python: requirements*.txt ────────────────────────────────
+                if re.match(r'requirements.*\.txt$', fname, re.I):
+                    try:
+                        with open(fpath, encoding='utf-8', errors='replace') as fh:
+                            for raw in fh:
+                                line = raw.strip()
+                                if not line or line.startswith('#') or line.startswith('-'):
+                                    continue
+                                m = re.match(r'^([A-Za-z0-9_\-\.\[\]]+)\s*([><=!~,\s].*)?$', line)
+                                if m:
+                                    name = m.group(1)
+                                    ver  = (m.group(2) or '').strip() or '*'
+                                    pkgs.append({'name': name, 'version': ver,
+                                                 'type': 'PyPI', 'file': rel_fpath,
+                                                 'azure_related': _is_azure(name)})
+                    except Exception as e:
+                        self.logger.debug(f"Cannot parse {rel_fpath}: {e}")
+
+                # ── Python: pyproject.toml ───────────────────────────────────
+                elif fname.lower() == 'pyproject.toml':
+                    try:
+                        import tomllib  # Python 3.11+
+                    except ImportError:
+                        try:
+                            import tomli as tomllib  # fallback
+                        except ImportError:
+                            tomllib = None
+                    if tomllib:
+                        try:
+                            with open(fpath, 'rb') as fh:
+                                data = tomllib.load(fh)
+                            deps = (data.get('project', {}).get('dependencies', [])
+                                    or data.get('tool', {}).get('poetry', {}).get('dependencies', {}).keys())
+                            for dep in deps:
+                                name = str(dep).split('[')[0].strip()
+                                pkgs.append({'name': name, 'version': '*',
+                                             'type': 'PyPI', 'file': rel_fpath,
+                                             'azure_related': _is_azure(name)})
+                        except Exception as e:
+                            self.logger.debug(f"Cannot parse {rel_fpath}: {e}")
+                    else:
+                        # Fallback: regex parse
+                        try:
+                            with open(fpath, encoding='utf-8', errors='replace') as fh:
+                                content = fh.read()
+                            for m in re.finditer(r'"([A-Za-z0-9_\-\.]+)\s*[>=<!]', content):
+                                name = m.group(1)
+                                pkgs.append({'name': name, 'version': '*',
+                                             'type': 'PyPI', 'file': rel_fpath,
+                                             'azure_related': _is_azure(name)})
+                        except Exception:
+                            pass
+
+                # ── Python: Pipfile ──────────────────────────────────────────
+                elif fname == 'Pipfile':
+                    try:
+                        with open(fpath, encoding='utf-8', errors='replace') as fh:
+                            content = fh.read()
+                        in_pkg = False
+                        for line in content.splitlines():
+                            if re.match(r'^\[packages\]', line, re.I):
+                                in_pkg = True; continue
+                            if line.startswith('['):
+                                in_pkg = False
+                            if in_pkg:
+                                m = re.match(r'^([A-Za-z0-9_\-\.]+)\s*=\s*"?([^"]+)"?', line)
+                                if m:
+                                    pkgs.append({'name': m.group(1), 'version': m.group(2).strip(),
+                                                 'type': 'PyPI', 'file': rel_fpath,
+                                                 'azure_related': _is_azure(m.group(1))})
+                    except Exception as e:
+                        self.logger.debug(f"Cannot parse {rel_fpath}: {e}")
+
+                # ── Node.js: package.json ────────────────────────────────────
+                elif fname == 'package.json':
+                    try:
+                        with open(fpath, encoding='utf-8', errors='replace') as fh:
+                            data = json.load(fh)
+                        for section in ('dependencies', 'devDependencies', 'peerDependencies'):
+                            for name, ver in (data.get(section) or {}).items():
+                                pkgs.append({'name': name, 'version': str(ver),
+                                             'type': 'npm', 'file': rel_fpath,
+                                             'azure_related': _is_azure(name)})
+                    except Exception as e:
+                        self.logger.debug(f"Cannot parse {rel_fpath}: {e}")
+
+                # ── Maven: pom.xml ───────────────────────────────────────────
+                elif fname == 'pom.xml':
+                    try:
+                        tree = ET.parse(fpath)
+                        ns   = {'m': 'http://maven.apache.org/POM/4.0.0'}
+                        # Try with namespace first, then without
+                        root_el = tree.getroot()
+                        ns_prefix = 'm:' if root_el.tag.startswith('{http://maven.apache.org') else ''
+                        for dep in root_el.iter(
+                            f'{{{ns["m"]}}}dependency' if ns_prefix else 'dependency'
+                        ):
+                            gid = (dep.findtext(f'{{{ns["m"]}}}groupId'   if ns_prefix else 'groupId') or '').strip()
+                            aid = (dep.findtext(f'{{{ns["m"]}}}artifactId' if ns_prefix else 'artifactId') or '').strip()
+                            ver = (dep.findtext(f'{{{ns["m"]}}}version'    if ns_prefix else 'version') or '*').strip()
+                            name = f"{gid}:{aid}" if gid else aid
+                            pkgs.append({'name': name, 'version': ver,
+                                         'type': 'Maven', 'file': rel_fpath,
+                                         'azure_related': _is_azure(name)})
+                    except Exception as e:
+                        self.logger.debug(f"Cannot parse {rel_fpath}: {e}")
+
+                # ── Gradle: build.gradle / build.gradle.kts ──────────────────
+                elif fname in ('build.gradle', 'build.gradle.kts'):
+                    try:
+                        with open(fpath, encoding='utf-8', errors='replace') as fh:
+                            content = fh.read()
+                        for m in re.finditer(
+                            r"(?:implementation|api|compile|testImplementation|runtimeOnly)"
+                            r"\s*['\"]([^'\"]+)['\"]", content
+                        ):
+                            parts = m.group(1).split(':')
+                            name  = ':'.join(parts[:2]) if len(parts) >= 2 else parts[0]
+                            ver   = parts[2].strip() if len(parts) >= 3 else '*'
+                            pkgs.append({'name': name, 'version': ver,
+                                         'type': 'Gradle', 'file': rel_fpath,
+                                         'azure_related': _is_azure(name)})
+                    except Exception as e:
+                        self.logger.debug(f"Cannot parse {rel_fpath}: {e}")
+
+                # ── Go: go.mod ───────────────────────────────────────────────
+                elif fname == 'go.mod':
+                    try:
+                        with open(fpath, encoding='utf-8', errors='replace') as fh:
+                            content = fh.read()
+                        for m in re.finditer(
+                            r'^(?:require\s+)?([a-zA-Z0-9_\-\./]+azure[a-zA-Z0-9_\-\./]*|'
+                            r'github\.com/Azure/[a-zA-Z0-9_\-]+)\s+([^\s]+)',
+                            content, re.M | re.I
+                        ):
+                            pkgs.append({'name': m.group(1), 'version': m.group(2).strip(),
+                                         'type': 'Go Module', 'file': rel_fpath,
+                                         'azure_related': _is_azure(m.group(1))})
+                        # Also collect all requires
+                        for m in re.finditer(r'^\t([^ ]+) ([^ \n]+)', content, re.M):
+                            name = m.group(1).strip()
+                            if name and not name.startswith('//'):
+                                pkgs.append({'name': name, 'version': m.group(2).strip(),
+                                             'type': 'Go Module', 'file': rel_fpath,
+                                             'azure_related': _is_azure(name)})
+                    except Exception as e:
+                        self.logger.debug(f"Cannot parse {rel_fpath}: {e}")
+
+                # ── Ruby: Gemfile ────────────────────────────────────────────
+                elif fname == 'Gemfile':
+                    try:
+                        with open(fpath, encoding='utf-8', errors='replace') as fh:
+                            content = fh.read()
+                        for m in re.finditer(r"gem\s+['\"]([^'\"]+)['\"](?:,\s*['\"]([^'\"]+)['\"])?", content):
+                            pkgs.append({'name': m.group(1), 'version': m.group(2) or '*',
+                                         'type': 'RubyGem', 'file': rel_fpath,
+                                         'azure_related': _is_azure(m.group(1))})
+                    except Exception as e:
+                        self.logger.debug(f"Cannot parse {rel_fpath}: {e}")
+
+                # ── PHP: composer.json ───────────────────────────────────────
+                elif fname == 'composer.json':
+                    try:
+                        with open(fpath, encoding='utf-8', errors='replace') as fh:
+                            data = json.load(fh)
+                        for section in ('require', 'require-dev'):
+                            for name, ver in (data.get(section) or {}).items():
+                                if name == 'php':
+                                    continue
+                                pkgs.append({'name': name, 'version': str(ver),
+                                             'type': 'Composer', 'file': rel_fpath,
+                                             'azure_related': _is_azure(name)})
+                    except Exception as e:
+                        self.logger.debug(f"Cannot parse {rel_fpath}: {e}")
+
+                # ── Rust: Cargo.toml ─────────────────────────────────────────
+                elif fname == 'Cargo.toml':
+                    try:
+                        with open(fpath, encoding='utf-8', errors='replace') as fh:
+                            content = fh.read()
+                        in_deps = False
+                        for line in content.splitlines():
+                            if re.match(r'^\[dependencies\]', line, re.I):
+                                in_deps = True; continue
+                            if line.startswith('['):
+                                in_deps = False
+                            if in_deps:
+                                m = re.match(r'^([A-Za-z0-9_\-]+)\s*=\s*"?([^"]+)"?', line)
+                                if m:
+                                    pkgs.append({'name': m.group(1), 'version': m.group(2).strip(),
+                                                 'type': 'Cargo (Rust)', 'file': rel_fpath,
+                                                 'azure_related': _is_azure(m.group(1))})
+                    except Exception as e:
+                        self.logger.debug(f"Cannot parse {rel_fpath}: {e}")
+
+                if pkgs:
+                    manifests[rel_fpath] = manifests.get(rel_fpath, []) + pkgs
+
+        # Summary log
+        azure_pkgs   = [p for pl in manifests.values() for p in pl if p.get('azure_related')]
+        total_pkgs   = sum(len(v) for v in manifests.values())
+        self.logger.info(
+            f"    Dependency manifests: {len(manifests)} file(s), "
+            f"{total_pkgs} total packages, {len(azure_pkgs)} Azure-related"
+        )
+        if azure_pkgs:
+            seen: set = set()
+            self.logger.info("    Azure-related packages detected:")
+            for p in azure_pkgs:
+                key = f"{p['type']}:{p['name']}"
+                if key not in seen:
+                    seen.add(key)
+                    self.logger.info(f"      [{p['type']}] {p['name']} {p['version']}  ({p['file']})")
+        return manifests
+
     def scan_dotnet_code(self, repo_path, repo_name):
         """Comprehensive .NET code analysis"""
         dotnet_data = {
@@ -3715,6 +4107,7 @@ class AzureDiscovery:
         total_sens  = 0
         sub_opts: Set[str]  = set()
         type_opts: Set[str] = set()
+        team_opts: Set[str] = set()   # serviceTeam / service-team tag values
 
         import html as _html   # stdlib – escape untrusted data injected into HTML
         _he = _html.escape     # shorthand: _he(s) → HTML-safe string
@@ -3742,6 +4135,16 @@ class AzureDiscovery:
                     if has_sens:
                         total_sens += 1
 
+                    # ── service team tag (serviceTeam | service-team | service_team) ──
+                    raw_tags = res.get('tags') or {}
+                    svc_team = ''
+                    for _tk in raw_tags:
+                        if _tk.lower() in ('serviceteam', 'service-team', 'service_team'):
+                            svc_team = _he(str(raw_tags[_tk]))
+                            break
+                    if svc_team:
+                        team_opts.add(svc_team)
+
                     row_cls    = 'sens-row' if has_sens else ''
                     sens_badge = ('<span class="badge badge-warn">SENSITIVE</span>'
                                   if has_sens else '')
@@ -3767,7 +4170,7 @@ class AzureDiscovery:
 
                     rows_html += (
                         f'<tr class="{row_cls}" data-sub="{sub_name}" '
-                        f'data-type="{rtype_h}" onclick="openModal(\'{rid}\')" '
+                        f'data-type="{rtype_h}" data-team="{svc_team}" onclick="openModal(\'{rid}\')" '
                         f'style="cursor:pointer">'
                         f'<td>{sub_name}</td><td>{rg_name_h}</td><td>{rname}</td>'
                         f'<td>{rtype_h}</td><td>{rloc}</td><td>{sku}</td>'
@@ -3815,6 +4218,10 @@ class AzureDiscovery:
             '<option value="">All Types</option>'
             + ''.join(f'<option>{t}</option>' for t in sorted(type_opts))
         )
+        team_opts_html = (
+            '<option value="">All Service Teams</option>'
+            + ''.join(f'<option>{t}</option>' for t in sorted(team_opts))
+        )
         total_subs = len(full_inventory)
 
         html = f"""<!DOCTYPE html>
@@ -3839,6 +4246,12 @@ body{{font-family:Segoe UI,Arial,sans-serif;background:#f0f4f8;color:#222}}
 .controls input{{width:280px}}
 .btn-csv{{padding:8px 18px;background:#0078d4;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:.9rem}}
 .btn-csv:hover{{background:#006cbe}}
+.btn-group{{padding:8px 18px;background:#fff;color:#0078d4;border:1px solid #0078d4;border-radius:6px;cursor:pointer;font-size:.9rem}}
+.btn-group.active{{background:#0078d4;color:#fff}}
+.btn-group:hover{{background:#e5f1fb}}
+.btn-group.active:hover{{background:#006cbe}}
+.group-header{{background:#e5f1fb;font-weight:700;color:#0078d4;font-size:.82rem;text-transform:uppercase;letter-spacing:.06em;padding:8px 14px}}
+.group-header td{{background:#e5f1fb!important}}
 .table-wrap{{padding:24px 36px}}
 table{{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 2px 8px #0001}}
 th{{background:#0078d4;color:#fff;padding:10px 14px;text-align:left;font-size:.82rem;text-transform:uppercase;letter-spacing:.04em}}
@@ -3882,6 +4295,8 @@ pre{{background:#1e1e1e;color:#d4d4d4;padding:16px;border-radius:6px;overflow:au
          oninput="filterTable()">
   <select id="subFilter" onchange="filterTable()">{sub_opts_html}</select>
   <select id="typeFilter" onchange="filterTable()">{type_opts_html}</select>
+  <select id="teamFilter" onchange="filterTable()" title="Filter by serviceTeam / service-team tag">{team_opts_html}</select>
+  <button class="btn-group" id="groupBtn" onclick="toggleGroupByTeam()">Group by Service Team</button>
   <button class="btn-csv" onclick="exportCSV()">Export CSV</button>
 </div>
 <div class="table-wrap">
@@ -3919,28 +4334,72 @@ function copyText(id){{
   }}
 }}
 function filterTable(){{
-  var q   = document.getElementById('searchBox').value.toLowerCase();
-  var sub = document.getElementById('subFilter').value;
-  var typ = document.getElementById('typeFilter').value;
-  document.querySelectorAll('#tableBody tr').forEach(function(row){{
-    var txt  = row.textContent.toLowerCase();
-    var rSub = row.getAttribute('data-sub')  || '';
-    var rTyp = row.getAttribute('data-type') || '';
+  var q    = document.getElementById('searchBox').value.toLowerCase();
+  var sub  = document.getElementById('subFilter').value;
+  var typ  = document.getElementById('typeFilter').value;
+  var team = document.getElementById('teamFilter').value;
+  document.querySelectorAll('#tableBody tr:not(.group-header)').forEach(function(row){{
+    var txt   = row.textContent.toLowerCase();
+    var rSub  = row.getAttribute('data-sub')  || '';
+    var rTyp  = row.getAttribute('data-type') || '';
+    var rTeam = row.getAttribute('data-team') || '';
     var ok = (q === '' || txt.includes(q))
-          && (sub === '' || rSub === sub)
-          && (typ === '' || rTyp === typ);
+          && (sub  === '' || rSub  === sub)
+          && (typ  === '' || rTyp  === typ)
+          && (team === '' || rTeam === team);
     row.classList.toggle('hidden', !ok);
+  }});
+  // re-apply grouping headers if grouping is on
+  if(_groupByTeam) _applyGroupHeaders();
+}}
+var _groupByTeam = false;
+function toggleGroupByTeam(){{
+  _groupByTeam = !_groupByTeam;
+  var btn = document.getElementById('groupBtn');
+  btn.classList.toggle('active', _groupByTeam);
+  if(_groupByTeam){{
+    _applyGroupHeaders();
+  }} else {{
+    _removeGroupHeaders();
+  }}
+}}
+function _removeGroupHeaders(){{
+  document.querySelectorAll('#tableBody tr.group-header').forEach(function(r){{r.remove();}});
+}}
+function _applyGroupHeaders(){{
+  _removeGroupHeaders();
+  var tbody = document.getElementById('tableBody');
+  var rows  = Array.from(tbody.querySelectorAll('tr:not(.group-header):not(.hidden)'));
+  // sort visible rows by team then by original order
+  rows.forEach(function(r,i){{r._origIdx=i;}});
+  rows.sort(function(a,b){{
+    var ta=(a.getAttribute('data-team')||'').toLowerCase();
+    var tb=(b.getAttribute('data-team')||'').toLowerCase();
+    if(ta<tb) return -1; if(ta>tb) return 1; return a._origIdx-b._origIdx;
+  }});
+  var lastTeam = null;
+  rows.forEach(function(row){{
+    var t = row.getAttribute('data-team') || '';
+    var teamLabel = t || '(no service team tag)';
+    if(t !== lastTeam){{
+      lastTeam = t;
+      var hdr = document.createElement('tr');
+      hdr.className='group-header';
+      hdr.innerHTML='<td colspan="8">&#128101; Service Team: '+teamLabel+'</td>';
+      tbody.insertBefore(hdr, row);
+    }}
+    tbody.appendChild(row);
   }});
 }}
 function exportCSV(){{
   var rows = [['Subscription','ResourceGroup','Name','Type','Location',
-               'SKU','APIVersion','HasSensitive']];
-  document.querySelectorAll('#tableBody tr').forEach(function(row){{
-    if (!row.classList.contains('hidden')){{
-      rows.push(Array.from(row.querySelectorAll('td')).map(function(td){{
-        return '"' + td.textContent.replace(/"/g, '""') + '"';
-      }}));
-    }}
+               'SKU','APIVersion','HasSensitive','ServiceTeam']];
+  document.querySelectorAll('#tableBody tr:not(.hidden):not(.group-header)').forEach(function(row){{
+    var cells = Array.from(row.querySelectorAll('td')).map(function(td){{
+      return '"' + td.textContent.replace(/"/g, '""') + '"';
+    }});
+    cells.push('"' + (row.getAttribute('data-team')||'').replace(/"/g,'""') + '"');
+    rows.push(cells);
   }});
   var csv = rows.map(function(r){{return r.join(',');}}).join('\\n');
   var a   = document.createElement('a');

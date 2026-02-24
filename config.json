@@ -3,7 +3,11 @@
     "subscription_ids": [],
     "subscription_names": [],
     "output_dir": "./migration-output",
-    "parallel_workers": 8,
+
+    "_comment_parallel": "parallel_workers: number of threads used for concurrent resource-type discovery within a subscription (networking / VMs / App Services / SQL / Storage / PaaS all run in parallel). Increase for faster runs on large environments (12-20 recommended). git_clone_workers: parallel threads for cloning + scanning git repos.",
+    "parallel_workers": 10,
+    "git_clone_workers": 5,
+
     "skip_html": false,
     "skip_excel": true,
     "verbose": false,
@@ -22,14 +26,18 @@
     "collect_managed_identities": true,
     "collect_monitoring": true,
     "collect_other_resources": false,
+
+    "_comment_read_only": "read_only_enforce: when true, a custom HTTP policy is attached to every Azure SDK client that raises RuntimeError if any non-GET HTTP method is attempted. This makes accidental write operations impossible. Recommended: true.",
+    "read_only_enforce": true,
+
     "https_proxy": "",
     "no_proxy": "",
     "az_path": "",
 
-    "_comment_scan_code": "Set scan_code to true to enable Azure DevOps git repo scanning for application-level dependency detection. Requires azure_devops credentials below.",
+    "_comment_scan_code": "Set scan_code to true to enable Azure DevOps git repo scanning for application-level dependency detection. Requires azure_devops credentials below. Set to false to skip code scanning.",
     "scan_code": false,
 
-    "_comment_azure_devops": "Configure your Azure DevOps organisation and PAT token. 'projects' is a list of project names to scan; leave empty [] to scan all projects. 'repositories' inside each project entry is optional — omit to scan all repos in that project. Use 'branch' to override the default branch per-repo.",
+    "_comment_azure_devops": "Configure Azure DevOps org + PAT (Code Read scope). 'projects' lists projects to scan. Leave 'repositories' as [] to AUTO-DISCOVER all repos in that project via the REST API. 'repo_name' is the field name for each repo entry. Set scan_code=true above to enable.",
     "azure_devops": {
         "organization": "YOUR_ORG_NAME",
         "pat_token": "YOUR_PERSONAL_ACCESS_TOKEN",
@@ -37,16 +45,20 @@
             {
                 "project_name": "MyProject",
                 "repositories": [
-                    {"repo_name": "MyRepo", "branch": "main"},
-                    {"repo_name": "AnotherRepo"}
+                    { "repo_name": "my-api-service",      "branch": "main"    },
+                    { "repo_name": "my-frontend-app",     "branch": "develop" },
+                    { "repo_name": "shared-libraries",    "branch": "main"    }
                 ]
+            },
+            {
+                "project_name": "AnotherProject",
+                "repositories": []
             }
         ]
     },
 
-    "_comment_git_tuning": "Git clone / scan tuning knobs. git_clone_depth: shallow clone depth (1 = fastest). git_clone_workers: parallel repo clone threads. git_max_file_kb: skip files larger than this size. git_scan_extensions: only scan files with these extensions. git_skip_dirs: directory names to skip during scanning.",
+    "_comment_git_tuning": "git_clone_depth: shallow clone depth (1 = fastest). git_clone_workers: parallel repo clone + scan threads (increase for large repo counts). git_max_file_kb: skip files larger than this size. git_scan_extensions: only scan files with these extensions. git_skip_dirs: directory names to skip during scanning.",
     "git_clone_depth": 1,
-    "git_clone_workers": 3,
     "git_max_file_kb": 512,
     "git_scan_extensions": [
         ".py", ".js", ".ts", ".cs", ".java", ".go",
