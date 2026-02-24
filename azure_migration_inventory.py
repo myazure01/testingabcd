@@ -1792,6 +1792,83 @@ class DependencyMapper:
 # ── Prompts 12+13: HTMLReportGenerator ───────────────────────────────────────
 class HTMLReportGenerator:
 
+    # ── service-team mappings ─────────────────────────────────────────────────
+    _TEAM_MAP = {
+        "web_apps":                   "compute",
+        "function_apps":              "compute",
+        "app_service_plans":          "compute",
+        "virtual_machines":           "compute",
+        "container_registries":       "compute",
+        "aks_clusters":               "compute",
+        "container_apps":             "compute",
+        "sql_servers":                "data",
+        "sql_databases":              "data",
+        "storage_accounts":           "data",
+        "cosmos_db":                  "data",
+        "redis_caches":               "data",
+        "data_factories":             "data",
+        "databricks_workspaces":      "data",
+        "search_services":            "data",
+        "key_vaults":                 "security",
+        "managed_identities":         "security",
+        "virtual_networks":           "networking",
+        "network_security_groups":    "networking",
+        "route_tables":               "networking",
+        "public_ips":                 "networking",
+        "private_endpoints":          "networking",
+        "private_dns_zones":          "networking",
+        "application_gateways":       "networking",
+        "waf_policies":               "networking",
+        "load_balancers":             "networking",
+        "traffic_managers":           "networking",
+        "log_analytics_workspaces":   "monitoring",
+        "app_insights":               "monitoring",
+        "diagnostic_settings":        "monitoring",
+        "alert_rules":                "monitoring",
+        "action_groups":              "monitoring",
+        "activity_log_alerts":        "monitoring",
+        "scheduled_query_alerts":     "monitoring",
+        "smart_detector_alert_rules": "monitoring",
+        "event_grid_topics":          "integration",
+        "event_grid_domains":         "integration",
+        "service_bus":                "integration",
+        "event_hubs":                 "integration",
+        "api_management":             "integration",
+        "notification_hubs":          "integration",
+        "cdn_profiles":               "integration",
+    }
+    _TEAM_LABELS = {
+        "compute":     ("Compute",     "#0078D4"),
+        "data":        ("Data",        "#217346"),
+        "networking":  ("Networking",  "#8764B8"),
+        "security":    ("Security",    "#C50F1F"),
+        "monitoring":  ("Monitoring",  "#CA5010"),
+        "integration": ("Integration", "#986F0B"),
+    }
+    # Risk category → team slug
+    _CATEGORY_TO_TEAM = {
+        "Security":   "security",
+        "Identity":   "security",
+        "Secret":     "security",
+        "Config":     "compute",
+        "Network":    "networking",
+        "Governance": "monitoring",
+        "Performance":"compute",
+        "Cost":       "monitoring",
+    }
+    # Checklist owner → team slug (space-separated for multi-team)
+    _OWNER_TO_TEAM = {
+        "Ops":          "monitoring",
+        "DBA":          "data",
+        "Security":     "security",
+        "Network":      "networking",
+        "DevOps":       "compute",
+        "Identity":     "security",
+        "QA":           "compute",
+        "DBA/Security": "data security",
+        "All":          "",
+    }
+
     def __init__(self, inventory, dep_map, risks, order):
         self.inv   = inventory
         self.dep   = dep_map
@@ -1854,42 +1931,95 @@ tr:hover td{background:#d0e8f8}
 .btn{padding:8px 16px;background:#0078D4;color:white;border:none;border-radius:4px;cursor:pointer;margin:4px}
 .btn:hover{background:#005a9e}
 #backToTop{position:fixed;bottom:24px;right:24px;background:#0078D4;color:white;border:none;border-radius:50%;width:40px;height:40px;font-size:18px;cursor:pointer;z-index:200}
-@media print{nav,#backToTop,.btn{display:none!important}}
+@media print{nav,#backToTop,.btn,#team-filter-bar{display:none!important}}
+#team-filter-bar{position:sticky;top:43px;z-index:99;background:#1a4f8a;padding:5px 16px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;border-bottom:1px solid rgba(255,255,255,.15)}
+#team-filter-bar span{color:rgba(255,255,255,.75);font-size:11px;margin-right:4px;text-transform:uppercase;letter-spacing:0.5px}
+.team-pill{border:none;border-radius:20px;padding:3px 12px;font-size:12px;cursor:pointer;font-weight:600;opacity:.7;transition:opacity .15s,box-shadow .15s;color:white}
+.team-pill:hover{opacity:.9}
+.team-pill.active{opacity:1;box-shadow:0 0 0 2px white,0 0 0 4px var(--tc)}
+.team-pill[data-team='all']{background:#555}
+.team-pill[data-team='compute']{background:#0078D4;--tc:#0078D4}
+.team-pill[data-team='data']{background:#217346;--tc:#217346}
+.team-pill[data-team='networking']{background:#8764B8;--tc:#8764B8}
+.team-pill[data-team='security']{background:#C50F1F;--tc:#C50F1F}
+.team-pill[data-team='monitoring']{background:#CA5010;--tc:#CA5010}
+.team-pill[data-team='integration']{background:#986F0B;--tc:#986F0B}
 </style>"""
 
     def _js(self):
         return """<script>
 function filterTable(inputId,tableId){
-  var v=document.getElementById(inputId).value.toLowerCase();
+  var v=document.getElementById(inputId).value.toLowerCase().trim();
   document.querySelectorAll('#'+tableId+' tbody tr').forEach(function(tr){
-    tr.style.display=tr.innerText.toLowerCase().includes(v)?'':'none';
+    tr.style.display=tr.textContent.toLowerCase().includes(v)?'':'none';
   });
 }
+var _gsTimer=null;
+var _activeTeam='';
 function globalSearch(val){
+  if(_gsTimer) clearTimeout(_gsTimer);
+  _gsTimer=setTimeout(function(){ _doGlobalSearch(val); }, 150);
+}
+function filterByTeam(team){
+  _activeTeam=(team==='all')?'':team;
+  document.querySelectorAll('.team-pill').forEach(function(p){
+    p.classList.toggle('active', p.dataset.team===(team||'all'));
+  });
+  _doGlobalSearch(document.getElementById('global-search').value);
+}
+function _rowMatchesTeam(tr){
+  if(!_activeTeam) return true;
+  var t=tr.dataset.team||'';
+  return t===_activeTeam || t.split(' ').indexOf(_activeTeam)!==-1;
+}
+function _doGlobalSearch(val){
   var v=(val||'').toLowerCase().trim();
   var countEl=document.getElementById('search-count');
-  if(!v){
+  if(!v && !_activeTeam){
     // restore everything
     document.querySelectorAll('table tbody tr').forEach(function(tr){tr.style.display='';});
-    document.querySelectorAll('details').forEach(function(d){d.style.display='';});
-    document.querySelectorAll('.card,.rg-header').forEach(function(el){el.style.display='';});
+    document.querySelectorAll('details').forEach(function(d){d.style.display='';d.open=false;});
+    document.querySelectorAll('.card').forEach(function(el){el.style.display='';});
+    document.querySelectorAll('.rg-header').forEach(function(el){el.style.display='';});
     if(countEl) countEl.textContent='';
     return;
   }
   var found=0;
-  // search every table row on the page
+  // Use textContent (not innerText) so rows inside closed <details> are still searchable
   document.querySelectorAll('table tbody tr').forEach(function(tr){
-    var match=tr.innerText.toLowerCase().includes(v);
-    tr.style.display=match?'':'none';
+    var matchSearch=!v || tr.textContent.toLowerCase().includes(v);
+    var matchTeam=_rowMatchesTeam(tr);
+    var show=matchSearch && matchTeam;
+    tr.style.display=show?'':'none';
+    if(show) found++;
+  });
+  // Show/hide parent <details> based on visible child rows; auto-expand matching ones
+  document.querySelectorAll('details').forEach(function(d){
+    var hasMatch=Array.from(d.querySelectorAll('tbody tr')).some(function(tr){return tr.style.display!=='none';});
+    // Also check data-team on the details itself (hides whole section if team doesn't match)
+    var teamOk=!_activeTeam||!d.dataset.team||(d.dataset.team===_activeTeam);
+    d.style.display=(hasMatch && teamOk)?'':'none';
+    if(hasMatch && teamOk) d.open=true;
+  });
+  // Also search dependency flow boxes (pre.flow-box) in the Dep Flows section
+  document.querySelectorAll('pre.flow-box').forEach(function(pre){
+    var card=pre.closest('.card');
+    if(!card) return;
+    var match=!v || pre.textContent.toLowerCase().includes(v);
+    card.style.display=match?'':'none';
     if(match) found++;
   });
-  // show/hide parent <details> based on whether any child rows are visible
-  document.querySelectorAll('details').forEach(function(d){
-    var visible=Array.from(d.querySelectorAll('tbody tr')).some(function(tr){return tr.style.display!=='none';});
-    d.style.display=visible?'':'none';
-    if(visible) d.open=true;
+  // Show/hide rg-header along with its following sibling cards
+  document.querySelectorAll('.rg-header').forEach(function(hdr){
+    var el=hdr.nextElementSibling;
+    var anyVisible=false;
+    while(el && !el.classList.contains('rg-header')){
+      if(el.style.display!=='none') anyVisible=true;
+      el=el.nextElementSibling;
+    }
+    hdr.style.display=anyVisible?'':'none';
   });
-  if(countEl) countEl.textContent=found+' row'+(found===1?'':'s');
+  if(countEl) countEl.textContent=found+' match'+(found===1?'':'es');
 }
 function sortTable(th){
   var table=th.closest('table'),tbody=table.querySelector('tbody');
@@ -1954,6 +2084,16 @@ document.addEventListener('DOMContentLoaded',function(){
                + 'oninput="globalSearch(this.value)" autocomplete="off">'
                + '<span id="search-count"></span>'
                + '</nav>')
+        team_pills = ('<div id="team-filter-bar">'
+                     + '<span>Filter by team:</span>'
+                     + '<button class="team-pill active" data-team="all" onclick="filterByTeam(\'all\')">All</button>'
+                     + ''.join(
+                         f'<button class="team-pill" data-team="{slug}" '
+                         f'onclick="filterByTeam(\'{slug}\')">'
+                         f'{label}</button>'
+                         for slug, (label, _) in self._TEAM_LABELS.items()
+                     )
+                     + '</div>')
         parts = [
             "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>",
             "<meta name='viewport' content='width=device-width,initial-scale=1'>",
@@ -1961,6 +2101,7 @@ document.addEventListener('DOMContentLoaded',function(){
             self._css(),
             "</head><body>",
             nav,
+            team_pills,
             self._section_summary(),
             self._section_resource_groups(),
             self._section_dep_flows(),
@@ -1997,8 +2138,14 @@ document.addEventListener('DOMContentLoaded',function(){
             for res_type, res_list in resources.items():
                 if not res_list:
                     continue
+                team = self._TEAM_MAP.get(res_type, "")
+                team_attr = f' data-team="{team}"' if team else ''
                 label = res_type.replace("_", " ").title()
-                parts.append(f'<details><summary>{label} ({len(res_list)})</summary><div class="card">')
+                team_label, team_color = self._TEAM_LABELS.get(team, (team.title() if team else "", "#888"))
+                team_badge = (f' <span style="font-size:10px;background:{team_color};color:white;'
+                              f'padding:1px 7px;border-radius:10px;font-weight:normal;vertical-align:middle">'
+                              f'{team_label}</span>') if team_label else ''
+                parts.append(f'<details{team_attr}><summary>{label} ({len(res_list)}){team_badge}</summary><div class="card">')
                 parts.append('<table><thead><tr><th>Name</th><th>Location</th><th>Tags</th><th>Details</th><th>Migration Notes</th></tr></thead><tbody>')
                 for res in res_list:
                     name = self._esc(res.get("name",""))
@@ -2026,7 +2173,7 @@ document.addEventListener('DOMContentLoaded',function(){
                     elif res_type == "key_vaults":
                         details = f"URI: {self._esc(res.get('vault_uri',''))} | RBAC: {res.get('enable_rbac')}"
                     notes = " | ".join(res.get("bicep_notes", []))
-                    parts.append(f'<tr><td><strong>{name}</strong>{dep_chips}</td><td>{loc2}</td><td>{tag_pills}</td><td>{details}</td><td>{self._esc(notes)}</td></tr>')
+                    parts.append(f'<tr{team_attr}><td><strong>{name}</strong>{dep_chips}</td><td>{loc2}</td><td>{tag_pills}</td><td>{details}</td><td>{self._esc(notes)}</td></tr>')
                 parts.append('</tbody></table></div></details>')
         parts.append('</div>')
         return "\n".join(parts)
@@ -2099,7 +2246,9 @@ document.addEventListener('DOMContentLoaded',function(){
         for r in sorted(self.risks, key=lambda x: {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(x["risk_level"], 3)):
             bg = LEVEL_COLORS.get(r["risk_level"], "")
             style = f' style="background:{bg}"' if bg else ""
-            parts.append(f'<tr{style}>'
+            team = self._CATEGORY_TO_TEAM.get(r.get("risk_category", ""), "")
+            team_attr = f' data-team="{team}"' if team else ''
+            parts.append(f'<tr{style}{team_attr}>'
                 + f'<td>{self._esc(r["risk_id"])}</td>'
                 + f'<td>{self._esc(r["resource_group"])}</td>'
                 + f'<td>{self._esc(r["resource_name"])}</td>'
@@ -2121,7 +2270,9 @@ document.addEventListener('DOMContentLoaded',function(){
             if group["resources"]:
                 parts.append('<table><thead><tr><th>RG</th><th>Name</th><th>Type</th><th>Note</th></tr></thead><tbody>')
                 for res in group["resources"]:
-                    parts.append(f'<tr><td>{self._esc(res.get("rg",""))}</td><td>{self._esc(res.get("name",""))}</td><td>{self._esc(res.get("type",""))}</td><td>{self._esc(res.get("note",""))}</td></tr>')
+                    team = self._TEAM_MAP.get(res.get("type", ""), "")
+                    team_attr = f' data-team="{team}"' if team else ''
+                    parts.append(f'<tr{team_attr}><td>{self._esc(res.get("rg",""))}</td><td>{self._esc(res.get("name",""))}</td><td>{self._esc(res.get("type",""))}</td><td>{self._esc(res.get("note",""))}</td></tr>')
                 parts.append('</tbody></table>')
             parts.append('</div>')
         parts.append('</div>')
@@ -2160,7 +2311,9 @@ document.addEventListener('DOMContentLoaded',function(){
         parts = ['<div id="checklist" class="page"><h2>Migration Checklist</h2><div class="card">']
         parts.append('<table><thead><tr><th>Phase</th><th>Task</th><th>Owner</th><th>Notes</th></tr></thead><tbody>')
         for phase, task, owner, notes in tasks:
-            parts.append(f'<tr><td>{self._esc(phase)}</td><td>{self._esc(task)}</td><td>{self._esc(owner)}</td><td>{self._esc(notes)}</td></tr>')
+            team = self._OWNER_TO_TEAM.get(owner, "")
+            team_attr = f' data-team="{team}"' if team else ''
+            parts.append(f'<tr{team_attr}><td>{self._esc(phase)}</td><td>{self._esc(task)}</td><td>{self._esc(owner)}</td><td>{self._esc(notes)}</td></tr>')
         parts.append('</tbody></table></div></div>')
         return "\n".join(parts)
 
