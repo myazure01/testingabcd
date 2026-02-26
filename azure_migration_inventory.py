@@ -241,14 +241,25 @@ class AzureInventoryCollector:
         ]}
 
     def collect_all(self):
-        sub = self._az(["account", "show"]) or {}
-        all_rgs = self._az(["group", "list"]) or []
-        flat = self._az(["resource", "list"]) or []
+        # Run all three initialisation calls concurrently.
+        # "az resource list --query [].resourceGroup" returns only the RG-name
+        # field (~95 % less data than the full resource list), so it is much
+        # faster to transfer and parse on large subscriptions.
+        with ThreadPoolExecutor(max_workers=3) as _init_pool:
+            _f_sub  = _init_pool.submit(self._az, ["account", "show"])
+            _f_rgs  = _init_pool.submit(self._az, ["group",    "list"])
+            _f_flat = _init_pool.submit(self._az, ["resource", "list",
+                                                   "--query", "[].resourceGroup"])
+        sub     = _f_sub.result()  or {}
+        all_rgs = _f_rgs.result()  or []
+        # flat is now a list of RG-name strings (may contain None for sub-level
+        # resources – those are skipped below)
+        flat    = _f_flat.result() or []
 
         rg_counts = {}
-        for res in flat:
-            rg = res.get("resourceGroup", "")
-            rg_counts[rg] = rg_counts.get(rg, 0) + 1
+        for rg in flat:
+            if rg:
+                rg_counts[rg] = rg_counts.get(rg, 0) + 1
 
         # ── scope filtering from config ──────────────────────────────────────
         excluded = [r.lower() for r in getattr(self.args, "excluded_resource_groups", [])]
@@ -523,7 +534,7 @@ class AzureInventoryCollector:
         for svr_obj in servers:
             svr = svr_obj.get("name", "")
             futures = {}
-            with ThreadPoolExecutor(max_workers=3) as ex:
+            with ThreadPoolExecutor(max_workers=5) as ex:  # 5 futures
                 futures["show"]     = ex.submit(self._az, ["sql", "server", "show", "-n", svr, "-g", rg])
                 futures["fw_rules"] = ex.submit(self._az, ["sql", "server", "firewall-rule", "list", "-g", rg, "-s", svr])
                 futures["vnet_r"]   = ex.submit(self._az, ["sql", "server", "vnet-rule", "list", "-g", rg, "-s", svr])
@@ -564,7 +575,7 @@ class AzureInventoryCollector:
 
             for db in [d for d in dbs if d.get("name") != "master"]:
                 db_name = db.get("name", "")
-                with ThreadPoolExecutor(max_workers=2) as ex:
+                with ThreadPoolExecutor(max_workers=4) as ex:  # 4 futures
                     f_show = ex.submit(self._az, ["sql", "db", "show", "-g", rg, "-s", svr, "-n", db_name])
                     f_tde  = ex.submit(self._az, ["sql", "db", "tde", "show", "-g", rg, "-s", svr, "-n", db_name])
                     f_ltr  = ex.submit(self._az, ["sql", "db", "ltr-policy", "show", "-g", rg, "-s", svr, "-n", db_name])
@@ -608,7 +619,7 @@ class AzureInventoryCollector:
         for a in accounts:
             name = a.get("name", "")
             futures = {}
-            with ThreadPoolExecutor(max_workers=3) as ex:
+            with ThreadPoolExecutor(max_workers=4) as ex:  # 4 futures
                 futures["show"]       = ex.submit(self._az, ["storage", "account", "show", "-n", name, "-g", rg])
                 futures["blob_svc"]   = ex.submit(self._az, ["storage", "account", "blob-service-properties", "show", "--account-name", name])
                 futures["containers"] = ex.submit(self._az, ["storage", "container", "list", "--account-name", name, "--auth-mode", "login", "--num-results", "100"])
@@ -664,7 +675,7 @@ class AzureInventoryCollector:
         for v in vaults:
             name = v.get("name", "")
             futures = {}
-            with ThreadPoolExecutor(max_workers=3) as ex:
+            with ThreadPoolExecutor(max_workers=4) as ex:  # 4 futures
                 futures["show"]    = ex.submit(self._az, ["keyvault", "show", "-n", name, "-g", rg])
                 futures["secrets"] = ex.submit(self._az, ["keyvault", "secret", "list", "--vault-name", name])
                 futures["keys"]    = ex.submit(self._az, ["keyvault", "key", "list", "--vault-name", name])
@@ -844,7 +855,7 @@ class AzureInventoryCollector:
             return {"private_dns_zones": result}
 
         merged = {}
-        with ThreadPoolExecutor(max_workers=5) as ex:
+        with ThreadPoolExecutor(max_workers=6) as ex:  # 6 sub-collectors
             futs = [ex.submit(fn) for fn in [_vnets, _nsgs, _routes, _public_ips, _private_endpoints, _private_dns]]
         for fut in as_completed(futs):
             try:

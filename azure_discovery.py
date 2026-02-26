@@ -804,60 +804,48 @@ class AzureDiscovery:
                 self.logger.warning(f"⚠ WARNING: No resource groups found in subscription '{subscription_name}'")
                 self.logger.warning("   Please verify access with: az group list --subscription " + subscription_id)
             
-            # Discover all resources
-            self.logger.info("Discovering all resources...")
+            # ── Run resource-type discoverers AND generic resource list in PARALLEL ──
+            # resource_client.resources.list() paginates ALL resources serially and
+            # was the biggest SDK bottleneck.  Moving it into the same pool means it
+            # overlaps with all other typed discoverers instead of blocking them.
+            self.logger.info("Discovering all resources (parallel)...")
             resource_count = 0
-            try:
-                for resource in resource_client.resources.list():
-                    try:
-                        if any(rg in resource.id for rg in self.config['excluded_resource_groups']):
-                            continue
-                        
-                        resource_info = {
-                            'name': resource.name,
-                            'type': resource.type,
-                            'location': resource.location,
-                            'id': resource.id,
-                            'tags': resource.tags or {},
-                            'resource_group': resource.id.split('/')[4] if len(resource.id.split('/')) > 4 else 'unknown'
-                        }
-                        sub_data['resources'].append(resource_info)
-                        resource_count += 1
-                        
-                        # Add to resource group
-                        rg_name = resource_info['resource_group']
-                        if rg_name in sub_data['resource_groups']:
-                            sub_data['resource_groups'][rg_name]['resources'].append(resource_info)
-                    except Exception as e:
-                        self.logger.warning(f"Failed to process resource {getattr(resource, 'name', 'unknown')}: {e}")
-                        continue
-                        
-            except Exception as e:
-                self.logger.error(f"Error listing resources: {e}")
-                self.logger.error(traceback.format_exc())
-            
-            self.logger.info(f"✓ Found {len(sub_data['resources'])} total resources")
-            
-            if len(sub_data['resources']) == 0:
-                self.logger.warning(f"⚠ WARNING: No resources found in subscription '{subscription_name}'")
-                self.logger.warning("   This could indicate:")
-                self.logger.warning("   1. The subscription is empty")
-                self.logger.warning("   2. Insufficient permissions to list resources")
-                self.logger.warning("   3. API throttling or connectivity issues")
-                self.logger.warning("   Please verify with: az resource list --subscription " + subscription_id)
-            
-            self.discovery_data['summary']['total_resources'] += len(sub_data['resources'])
-            
-            # ── Run all resource-type discoverers in PARALLEL ─────────────────
-            # Each function writes to a distinct key of sub_data so no lock needed.
+
+            def _generic_resource_list():
+                nonlocal resource_count
+                try:
+                    for resource in resource_client.resources.list():
+                        try:
+                            if any(rg in resource.id for rg in self.config['excluded_resource_groups']):
+                                continue
+                            resource_info = {
+                                'name': resource.name,
+                                'type': resource.type,
+                                'location': resource.location,
+                                'id': resource.id,
+                                'tags': resource.tags or {},
+                                'resource_group': resource.id.split('/')[4] if len(resource.id.split('/')) > 4 else 'unknown'
+                            }
+                            sub_data['resources'].append(resource_info)
+                            resource_count += 1
+                            rg_name = resource_info['resource_group']
+                            if rg_name in sub_data['resource_groups']:
+                                sub_data['resource_groups'][rg_name]['resources'].append(resource_info)
+                        except Exception as e:
+                            self.logger.warning(f"Failed to process resource {getattr(resource, 'name', 'unknown')}: {e}")
+                except Exception as e:
+                    self.logger.error(f"Error listing resources: {e}")
+                    self.logger.error(traceback.format_exc())
+
             _max_w = self.config.get('parallel_workers', 8)
             _discover_tasks = {
-                'networking':       lambda: self.discover_networking(network_client, sub_data),
-                'virtual_machines': lambda: self.discover_virtual_machines(compute_client, sub_data),
-                'app_services':     lambda: self.discover_app_services(web_client, sub_data, subscription_id),
-                'sql_databases':    lambda: self.discover_sql_databases(sql_client, sub_data),
-                'storage_accounts': lambda: self.discover_storage_accounts(storage_client, sub_data),
-                'paas_services':    lambda: self.discover_paas_services(subscription_id, sub_data),
+                'generic_resources': _generic_resource_list,
+                'networking':        lambda: self.discover_networking(network_client, sub_data),
+                'virtual_machines':  lambda: self.discover_virtual_machines(compute_client, sub_data),
+                'app_services':      lambda: self.discover_app_services(web_client, sub_data, subscription_id),
+                'sql_databases':     lambda: self.discover_sql_databases(sql_client, sub_data),
+                'storage_accounts':  lambda: self.discover_storage_accounts(storage_client, sub_data),
+                'paas_services':     lambda: self.discover_paas_services(subscription_id, sub_data),
             }
             self.logger.info(f"Running {len(_discover_tasks)} discovery tasks in parallel (max_workers={_max_w})...")
             with ThreadPoolExecutor(max_workers=_max_w) as _pool:
@@ -869,6 +857,16 @@ class AzureDiscovery:
                     except Exception as _e:
                         self.logger.error(f"Error in {_name} discovery: {_e}")
                         self.logger.error(traceback.format_exc())
+
+            self.logger.info(f"✓ Found {len(sub_data['resources'])} total resources")
+            if len(sub_data['resources']) == 0:
+                self.logger.warning(f"⚠ WARNING: No resources found in subscription '{subscription_name}'")
+                self.logger.warning("   1. The subscription is empty")
+                self.logger.warning("   2. Insufficient permissions to list resources")
+                self.logger.warning("   3. API throttling or connectivity issues")
+                self.logger.warning("   Please verify with: az resource list --subscription " + subscription_id)
+
+            self.discovery_data['summary']['total_resources'] += len(sub_data['resources'])
             
             # Store subscription data
             self.discovery_data['subscriptions'][subscription_id] = sub_data
