@@ -1904,10 +1904,13 @@ class HTMLReportGenerator:
                 yield res_type, res_list
 
     # ── service-team tag helpers ──────────────────────────────────────────────
-    _SVC_TEAM_TAG_KEYS = frozenset(('serviceteam', 'service-team', 'service_team'))
+    # Canonical ServiceTeam tag — all of these are treated as the same key:
+    #   serviceTeam  |  service-team  |  service_team  |  Owner  |  owner
+    _SVC_TEAM_TAG_KEYS = frozenset(('serviceteam', 'service-team', 'service_team', 'owner'))
 
     def _get_res_svc_team(self, res: dict) -> str:
-        """Return the value of the serviceTeam/service-team/service_team tag, or ''."""
+        """Return the ServiceTeam value from any alias key
+        (serviceTeam / service-team / service_team / Owner / owner), or ''."""
         for k, v in (res.get("tags") or {}).items():
             if k.lower() in self._SVC_TEAM_TAG_KEYS:
                 return str(v)
@@ -1980,6 +1983,12 @@ tr:hover td{background:#d0e8f8}
 .team-pill[data-team='security']{background:#C50F1F;--tc:#C50F1F}
 .team-pill[data-team='monitoring']{background:#CA5010;--tc:#CA5010}
 .team-pill[data-team='integration']{background:#986F0B;--tc:#986F0B}
+#svcteam-filter-bar{position:sticky;top:84px;z-index:98;background:#0f3460;padding:5px 16px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid rgba(255,255,255,.12)}
+#svcteam-filter-bar label{color:rgba(255,255,255,.85);font-size:11px;text-transform:uppercase;letter-spacing:0.5px;white-space:nowrap;cursor:default}
+#svcteam-dropdown{padding:3px 10px;border-radius:4px;border:1px solid rgba(255,255,255,.35);font-size:12px;background:rgba(255,255,255,.12);color:white;cursor:pointer;min-width:200px;max-width:360px}#svcteam-dropdown option{background:#1a4f8a;color:white}
+#svcteam-clear{background:rgba(255,255,255,.15);color:white;border:1px solid rgba(255,255,255,.3);border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer}#svcteam-clear:hover{background:rgba(255,255,255,.3)}
+#svcteam-count{font-size:11px;color:rgba(255,255,255,.65);margin-left:4px}
+@media print{#svcteam-filter-bar{display:none!important}}
 </style>"""
 
     def _js(self):
@@ -1992,6 +2001,13 @@ function filterTable(inputId,tableId){
 }
 var _gsTimer=null;
 var _activeTeam='';
+var _activeSvcTeam='';
+function filterBySvcTeam(val){
+  _activeSvcTeam=(val||'').trim();
+  var countEl=document.getElementById('svcteam-count');
+  if(countEl) countEl.textContent=_activeSvcTeam ? '\u2014 showing: '+_activeSvcTeam : '';
+  _doGlobalSearch(document.getElementById('global-search').value);
+}
 function globalSearch(val){
   if(_gsTimer) clearTimeout(_gsTimer);
   _gsTimer=setTimeout(function(){ _doGlobalSearch(val); }, 150);
@@ -2008,10 +2024,15 @@ function _rowMatchesTeam(tr){
   var t=tr.dataset.team||'';
   return t===_activeTeam || t.split(' ').indexOf(_activeTeam)!==-1;
 }
+function _rowMatchesSvcTeam(tr){
+  if(!_activeSvcTeam) return true;
+  var t=(tr.dataset.svcteam||'').toLowerCase().trim();
+  return t===_activeSvcTeam.toLowerCase().trim();
+}
 function _doGlobalSearch(val){
   var v=(val||'').toLowerCase().trim();
   var countEl=document.getElementById('search-count');
-  if(!v && !_activeTeam){
+  if(!v && !_activeTeam && !_activeSvcTeam){
     // restore everything
     document.querySelectorAll('table tbody tr').forEach(function(tr){tr.style.display='';});
     document.querySelectorAll('details').forEach(function(d){d.style.display='';d.open=false;});
@@ -2025,7 +2046,8 @@ function _doGlobalSearch(val){
   document.querySelectorAll('table tbody tr').forEach(function(tr){
     var matchSearch=!v || tr.textContent.toLowerCase().includes(v);
     var matchTeam=_rowMatchesTeam(tr);
-    var show=matchSearch && matchTeam;
+    var matchSvcTeam=_rowMatchesSvcTeam(tr);
+    var show=matchSearch && matchTeam && matchSvcTeam;
     tr.style.display=show?'':'none';
     if(show) found++;
   });
@@ -2130,24 +2152,35 @@ document.addEventListener('DOMContentLoaded',function(){
                 for slug, (label, _) in self._TEAM_LABELS.items()
             )
         )
-        # Dynamic tag-based service-team pills (prefixed with "tag:")
-        tag_pills_html = ''.join(
-            f'<button class="team-pill" style="background:#f0f8ff;color:#0078D4;border-color:#0078D4" '
-            f'data-team="{self._esc(t)}" onclick="filterByTeam(\'{self._esc(t)}\')">'
-            f'&#128101; {self._esc(t)}</button>'
-            for t in sorted(tag_teams.keys())
-        )
-        tag_section_html = (
-            '<span style="margin-left:12px;color:#666;font-size:12px">Service Team tags:</span>'
-            + tag_pills_html
-        ) if tag_teams else ''
         team_pills = (
             '<div id="team-filter-bar">'
             + '<span>Filter by team:</span>'
             + static_pills
-            + tag_section_html
             + '</div>'
         )
+        # ServiceTeam dropdown filter — covers serviceTeam / service-team / service_team / Owner / owner
+        if tag_teams:
+            svc_team_options = ''.join(
+                f'<option value="{self._esc(t)}">'
+                f'\N{BUSTS IN SILHOUETTE} {self._esc(t)} ({len(entries)} resource{"s" if len(entries) != 1 else ""})'
+                f'</option>'
+                for t, entries in sorted(tag_teams.items())
+            )
+            svc_team_filter = (
+                '<div id="svcteam-filter-bar">'
+                '<label for="svcteam-dropdown">&#128100; ServiceTeam tag filter:</label>'
+                '<select id="svcteam-dropdown" onchange="filterBySvcTeam(this.value)">'
+                '<option value="">&mdash; All service teams &mdash;</option>'
+                + svc_team_options
+                + '</select>'
+                '<button id="svcteam-clear" '
+                'onclick="filterBySvcTeam(\'\');document.getElementById(\'svcteam-dropdown\').value=\'\'">'
+                '&#10005; Clear</button>'
+                '<span id="svcteam-count"></span>'
+                '</div>'
+            )
+        else:
+            svc_team_filter = ''
         parts = [
             "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>",
             "<meta name='viewport' content='width=device-width,initial-scale=1'>",
@@ -2156,6 +2189,7 @@ document.addEventListener('DOMContentLoaded',function(){
             "</head><body>",
             nav,
             team_pills,
+            svc_team_filter,
             self._section_summary(),
             self._section_resource_groups(),
             self._section_service_teams(tag_teams),
@@ -2213,6 +2247,7 @@ document.addEventListener('DOMContentLoaded',function(){
                     svc_team_val = self._get_res_svc_team(res)
                     res_team_attr = (f' data-team="{self._esc(svc_team_val)}"'
                                      if svc_team_val else team_attr)
+                    svc_team_data_attr = f' data-svcteam="{self._esc(svc_team_val)}"' if svc_team_val else ''
                     svc_team_pill = (
                         f'<span class="chip" style="background:#0078D4;color:white;font-size:10px">'
                         f'{self._esc(svc_team_val)}</span>'
@@ -2238,7 +2273,7 @@ document.addEventListener('DOMContentLoaded',function(){
                     elif res_type == "key_vaults":
                         details = f"URI: {self._esc(res.get('vault_uri',''))} | RBAC: {res.get('enable_rbac')}"
                     notes = " | ".join(res.get("bicep_notes", []))
-                    parts.append(f'<tr{res_team_attr}><td><strong>{name}</strong>{dep_chips}</td><td>{loc2}</td><td>{tag_pills}</td><td>{svc_team_pill}</td><td>{details}</td><td>{self._esc(notes)}</td></tr>')
+                    parts.append(f'<tr{res_team_attr}{svc_team_data_attr}><td><strong>{name}</strong>{dep_chips}</td><td>{loc2}</td><td>{tag_pills}</td><td>{svc_team_pill}</td><td>{details}</td><td>{self._esc(notes)}</td></tr>')
                 parts.append('</tbody></table></div></details>')
         parts.append('</div>')
         return "\n".join(parts)
@@ -2248,8 +2283,9 @@ document.addEventListener('DOMContentLoaded',function(){
         parts = ['<div id="service-teams" class="page"><h2>&#128101; Service Teams</h2>']
         if not tag_teams:
             parts.append('<div class="card"><em>No resources have a <code>serviceTeam</code>, '
-                         '<code>service-team</code>, or <code>service_team</code> tag. '
-                         'Add that tag to your Azure resources to enable grouping here.</em></div>')
+                         '<code>service-team</code>, <code>service_team</code>, or <code>Owner</code> tag. '
+                         'All of these tag key variants are treated as equivalent. '
+                         'Add any of them to your Azure resources to enable grouping here.</em></div>')
             parts.append('</div>')
             return "\n".join(parts)
 
@@ -2286,7 +2322,7 @@ document.addEventListener('DOMContentLoaded',function(){
                     if k.lower() not in self._SVC_TEAM_TAG_KEYS
                 ) or '<span style="color:#999;font-size:11px">—</span>'
                 parts.append(
-                    f'<tr data-team="{esc_name}">'
+                    f'<tr data-team="{esc_name}" data-svcteam="{esc_name}">'
                     f'<td><strong>{rname}</strong></td>'
                     f'<td>{rtype}</td>'
                     f'<td>{rrg}</td>'
