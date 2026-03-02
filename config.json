@@ -1,5 +1,4 @@
 {
-    "subscription_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
     "subscription_ids": [],
     "subscription_names": [],
     "output_dir": "./migration-output",
