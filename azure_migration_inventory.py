@@ -266,6 +266,13 @@ class AzureInventoryCollector:
             if rg:
                 rg_counts[rg] = rg_counts.get(rg, 0) + 1
 
+        # Safety fallback: if the flat resource-list query returned nothing but
+        # resource groups exist, the query may have failed (permissions, az CLI
+        # version, --query flag unsupported, etc.).  Treat all RGs as non-empty
+        # so collectors still run — they will return empty lists naturally for
+        # RGs that truly have no resources of a given type.
+        _counts_reliable = bool(rg_counts) or not all_rgs
+
         # ── scope filtering from config ──────────────────────────────────────
         excluded = [r.lower() for r in getattr(self.args, "excluded_resource_groups", [])]
         included = [r.lower() for r in getattr(self.args, "included_resource_groups", [])]
@@ -277,8 +284,9 @@ class AzureInventoryCollector:
         self.tracker.print_summary_table(
             ["Resource Group", "Location", "Resources", "Status"],
             [[rg.get("name"), rg.get("location"),
-              rg_counts.get(rg.get("name", ""), 0),
-              "EMPTY" if rg_counts.get(rg.get("name", ""), 0) == 0 else "collecting"]
+              rg_counts.get(rg.get("name", ""), "?") if _counts_reliable else "?",
+              ("EMPTY" if rg_counts.get(rg.get("name", ""), 0) == 0 else "collecting")
+               if _counts_reliable else "collecting"]
              for rg in all_rgs]
         )
 
@@ -288,8 +296,18 @@ class AzureInventoryCollector:
             "resource_groups": {}
         }
 
-        empty_rgs = [rg for rg in all_rgs if rg_counts.get(rg["name"], 0) == 0]
-        non_empty_rgs = [rg for rg in all_rgs if rg_counts.get(rg["name"], 0) > 0]
+        if _counts_reliable:
+            empty_rgs     = [rg for rg in all_rgs if rg_counts.get(rg["name"], 0) == 0]
+            non_empty_rgs = [rg for rg in all_rgs if rg_counts.get(rg["name"], 0) > 0]
+        else:
+            # Flat query failed — run collectors on every RG; empty ones will
+            # produce empty resource lists and be marked is_empty=True afterwards.
+            empty_rgs     = []
+            non_empty_rgs = list(all_rgs)
+            self.tracker.log_warning(
+                "Resource count query returned no data — collecting all RGs "
+                "(this is safe; empty RGs will be identified during collection)."
+            )
 
         for rg in empty_rgs:
             inventory["resource_groups"][rg["name"]] = {
@@ -380,6 +398,8 @@ class AzureInventoryCollector:
         rg_dict["resource_count"] = sum(
             len(v) for v in rg_dict["resources"].values()
         )
+        if rg_dict["resource_count"] == 0:
+            rg_dict["is_empty"] = True
         return rg_name, rg_dict
 
     # ── Prompt 5: Web App + Function App collectors ───────────────────────────
