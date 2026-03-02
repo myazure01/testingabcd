@@ -14,20 +14,71 @@ if hasattr(sys.stdout, "reconfigure"):
 
 # ── az CLI detection ──────────────────────────────────────────────────────────
 # On Windows, az ships as az.cmd and must run through cmd.exe (shell=True).
-# shutil.which respects PATHEXT so it resolves az → az.cmd automatically.
+# The bundled Python process may inherit a stripped PATH, so we:
+#  1. Try shutil.which with the current PATH
+#  2. Re-try with the full PATH read from the Windows registry (HKLM + HKCU)
+#  3. Fall back to known hard-coded install locations
 def _detect_az():
     import shutil
-    found = shutil.which("az")                   # returns full path e.g. C:\...\az.cmd
+
+    def _is_cmd(p): return str(p).lower().endswith((".cmd", ".bat"))
+
+    # 1. Quick check — works when az is already on the inherited PATH
+    found = shutil.which("az")
     if found:
-        is_cmd = found.lower().endswith((".cmd", ".bat"))
-        return found, is_cmd
-    # hard-coded fallback for default Azure CLI install paths on Windows
-    for p in (
+        return found, _is_cmd(found)
+
+    # 2. Read the full PATH from the Windows registry so we don't miss az
+    #    when the process was launched with a minimal environment (e.g. from
+    #    VS Code tasks, scheduled tasks, or the bundled Python launcher).
+    if os.name == "nt":
+        try:
+            import winreg
+            def _reg_path(hive, subkey):
+                try:
+                    with winreg.OpenKey(hive, subkey) as k:
+                        val, _ = winreg.QueryValueEx(k, "Path")
+                        return val or ""
+                except Exception:
+                    return ""
+            sys_path = _reg_path(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")
+            usr_path = _reg_path(
+                winreg.HKEY_CURRENT_USER,
+                r"Environment")
+            # Expand %SystemRoot% and similar variables
+            full_path = os.path.expandvars(sys_path + os.pathsep + usr_path)
+            found = shutil.which("az", path=full_path)
+            if found:
+                return found, _is_cmd(found)
+        except Exception:
+            pass
+
+    # 3. Hard-coded fallback paths covering all known az CLI install layouts
+    user_home = os.path.expanduser("~")
+    candidates = [
+        # Standard Windows MSI installs
         r"C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin\az.cmd",
         r"C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd",
-    ):
+        # Per-user installs (winget / standalone installer)
+        os.path.join(user_home, r"AppData\Local\Programs\Azure CLI\wbin\az.cmd"),
+        os.path.join(user_home, r"AppData\Local\Microsoft\WindowsApps\az.cmd"),
+        # Chocolatey
+        r"C:\ProgramData\chocolatey\bin\az.cmd",
+        r"C:\ProgramData\chocolatey\bin\az",
+        # Scoop
+        os.path.join(user_home, r"scoop\shims\az.cmd"),
+        os.path.join(user_home, r"scoop\shims\az"),
+        # WSL / Linux-style paths (unlikely but defensive)
+        "/usr/bin/az",
+        "/usr/local/bin/az",
+    ]
+    for p in candidates:
         if os.path.isfile(p):
-            return p, True
+            return p, _is_cmd(p)
+
+    # 4. Last resort — let subprocess try "az" and fail with a clear message
     return "az", False
 
 _AZ_EXE, _AZ_SHELL = _detect_az()
@@ -114,6 +165,10 @@ def run_az(args_list, verbose=False, subscription_id=None):
         print(f"[ERROR] Azure CLI not found. Searched for: {_AZ_EXE}")
         print("        Install from : https://aka.ms/installazurecliwindows")
         print("        After install, open a NEW terminal and run: az login")
+        print()
+        print("        If az is installed in a non-standard location, set")
+        print("        'az_path' in config.json, e.g.:")
+        print(r'          "az_path": "C:\\path\\to\\az.cmd"')
         sys.exit(1)
     except Exception as e:
         if verbose:
@@ -4179,7 +4234,7 @@ def main():
         tracker.log_info(f"Incl RGs: {', '.join(args.included_resource_groups)}")
 
     # ── check az login ────────────────────────────────────────────────────────
-    tracker.log_info(f"az CLI  : {' '.join(_AZ_CMD)}")
+    tracker.log_info(f"az CLI  : {' '.join(_AZ_CMD)}  (shell={_AZ_SHELL})")
     sub_info = run_az(["account", "show"], verbose=True)
     if not sub_info:
         print("[ERROR] Azure CLI is installed but you are not logged in, "
