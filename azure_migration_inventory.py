@@ -37,14 +37,14 @@ _AZ_CMD = [_AZ_EXE]
 def _az_subprocess_args(args_list):
     """Return (cmd, shell) ready for subprocess.run.
     On Windows with a .cmd file, shell=True is required and the command must
-    be a properly quoted string (shell=True + list silently drops all args
-    after the first on Windows).
+    be a properly quoted string.  Use subprocess.list2cmdline() so that args
+    containing spaces (subscription names, RG names, URLs, etc.) are quoted
+    correctly instead of being split by the shell.
     """
     full = _AZ_CMD + list(args_list) + ["--output", "json"]
     if _AZ_SHELL:
-        # Quote the exe path in case it contains spaces, join the rest normally
-        quoted_exe = f'"{_AZ_EXE}"'
-        return quoted_exe + " " + " ".join(full[1:]), True
+        # list2cmdline produces Windows-correct quoting for every argument
+        return subprocess.list2cmdline(full), True
     return full, False
 
 # ── dependency check ──────────────────────────────────────────────────────────
@@ -207,6 +207,7 @@ class ProgressTracker:
             self._p(sep)
             for row in rows:
                 self._p(fmt_row(row))
+            self._p(sep)
 
 
 # ── AzureInventoryCollector ───────────────────────────────────────────────────
@@ -256,6 +257,10 @@ class AzureInventoryCollector:
         # resources – those are skipped below)
         flat    = _f_flat.result() or []
 
+        # Store the resolved subscription ID so REST-URL helpers (e.g. Smart
+        # Detector alerts) can embed it without a separate API call.
+        self._active_sub_id = sub.get("id") or self._sub_id or ""
+
         rg_counts = {}
         for rg in flat:
             if rg:
@@ -289,7 +294,7 @@ class AzureInventoryCollector:
         for rg in empty_rgs:
             inventory["resource_groups"][rg["name"]] = {
                 "metadata": {"name": rg["name"], "location": rg.get("location"),
-                             "tags": {}, "provisioningState": "Succeeded"},
+                             "tags": rg.get("tags") or {}, "provisioningState": "Succeeded"},
                 "resource_count": 0, "is_empty": True,
                 "resources": self._empty_resources()
             }
@@ -299,7 +304,8 @@ class AzureInventoryCollector:
             for rg in non_empty_rgs:
                 name = rg["name"]
                 self.tracker.update_active_task(name, f"Collecting {name}")
-                futures[ex.submit(self._collect_rg, name, rg.get("location", ""))] = name
+                # Pass tags from group list so _collect_rg avoids an extra 'group show' call
+                futures[ex.submit(self._collect_rg, name, rg.get("location", ""), rg.get("tags") or {})] = name
 
             for fut in as_completed(futures):
                 rg_name, rg_dict = fut.result()
@@ -321,8 +327,9 @@ class AzureInventoryCollector:
         )
         return inventory
 
-    def _collect_rg(self, rg_name, rg_location):
-        tags = safe_get(self._az(["group", "show", "--name", rg_name]), "tags") or {}
+    def _collect_rg(self, rg_name, rg_location, rg_tags=None):
+        # Tags come from the group list fetched in collect_all — no extra API call needed
+        tags = rg_tags if rg_tags is not None else {}
         rg_dict = {
             "metadata": {"name": rg_name, "location": rg_location,
                          "tags": tags, "provisioningState": "Succeeded"},
@@ -351,9 +358,11 @@ class AzureInventoryCollector:
         collectors = [fn for flag, fn in FLAG_MAP if getattr(a, flag, True)]
 
         futures = {}
-        # Use enough workers to run all collector types concurrently.
-        # Cap at parallel_workers to avoid overwhelming the az CLI process pool.
-        _rg_workers = max(getattr(a, 'parallel_workers', 8), len(collectors))
+        # Run all collector types for this RG concurrently.
+        # Hard-cap at 14 (the number of collector functions) so that spawning
+        # 20 outer RG threads does not create an unbounded inner thread pool;
+        # there is no benefit to having more workers than collectors.
+        _rg_workers = max(1, min(len(collectors), 14))
         with ThreadPoolExecutor(max_workers=_rg_workers) as ex:
             for fn in collectors:
                 futures[ex.submit(fn, rg_name)] = fn.__name__
@@ -454,11 +463,11 @@ class AzureInventoryCollector:
                  "subnet_name": parse_resource_name(v.get("subnetResourceId", ""))}
                 for v in vnet
             ],
-            "slots_list": [s["name"] for s in slots],
+            "slots_list": [s.get("name", "") for s in slots],
             "app_setting_keys": app_setting_keys,
             "sensitive_keys": sensitive_keys,
             "kv_references": kv_references,
-            "conn_string_types": [{"name": c["name"], "type": c["type"]} for c in conn],
+            "conn_string_types": [{"name": c.get("name", ""), "type": c.get("type", "")} for c in conn],
             "custom_domains": custom_domains,
             "bicep_notes": bicep_notes,
         }
@@ -734,7 +743,7 @@ class AzureInventoryCollector:
         def _vnets():
             result = []
             for v in (self._az(["network", "vnet", "list", "-g", rg]) or []):
-                show = self._az(["network", "vnet", "show", "-n", v["name"], "-g", rg]) or v
+                show = v  # list already returns the full object — no separate show needed
                 result.append({
                     "id": show.get("id"), "name": show.get("name"),
                     "location": show.get("location"), "resourceGroup": rg,
@@ -764,7 +773,7 @@ class AzureInventoryCollector:
         def _nsgs():
             result = []
             for n in (self._az(["network", "nsg", "list", "-g", rg]) or []):
-                show = self._az(["network", "nsg", "show", "-n", n["name"], "-g", rg]) or n
+                show = n  # list already returns the full object — no separate show needed
                 def _rules(key):
                     return [{"name": r["name"], "priority": r.get("priority"),
                              "direction": r.get("direction"), "access": r.get("access"),
@@ -785,7 +794,7 @@ class AzureInventoryCollector:
         def _routes():
             result = []
             for t in (self._az(["network", "route-table", "list", "-g", rg]) or []):
-                show = self._az(["network", "route-table", "show", "-n", t["name"], "-g", rg]) or t
+                show = t  # list already returns the full object — no separate show needed
                 result.append({
                     "id": show.get("id"), "name": show.get("name"),
                     "location": show.get("location"), "resourceGroup": rg,
@@ -800,7 +809,7 @@ class AzureInventoryCollector:
         def _public_ips():
             result = []
             for p in (self._az(["network", "public-ip", "list", "-g", rg]) or []):
-                show = self._az(["network", "public-ip", "show", "-n", p["name"], "-g", rg]) or p
+                show = p  # list already returns the full object — no separate show needed
                 result.append({
                     "id": show.get("id"), "name": show.get("name"),
                     "location": show.get("location"), "resourceGroup": rg,
@@ -816,7 +825,7 @@ class AzureInventoryCollector:
         def _private_endpoints():
             result = []
             for pe in (self._az(["network", "private-endpoint", "list", "-g", rg]) or []):
-                show = self._az(["network", "private-endpoint", "show", "-n", pe["name"], "-g", rg]) or pe
+                show = pe  # list already returns the full object — no separate show needed
                 result.append({
                     "id": show.get("id"), "name": show.get("name"),
                     "location": show.get("location"), "resourceGroup": rg,
@@ -839,7 +848,7 @@ class AzureInventoryCollector:
             result = []
             for zone in (self._az(["network", "private-dns", "zone", "list", "-g", rg]) or []):
                 zone_name = zone.get("name", "")
-                show  = self._az(["network", "private-dns", "zone", "show", "-n", zone_name, "-g", rg]) or zone
+                show  = zone  # list already returns the full object — no separate show needed
                 links = self._az(["network", "private-dns", "link", "vnet", "list", "-g", rg, "-z", zone_name]) or []
                 result.append({
                     "id": show.get("id"), "name": zone_name,
@@ -869,7 +878,7 @@ class AzureInventoryCollector:
         agw_list = []
         for agw in agws:
             name = agw.get("name", "")
-            show = self._az(["network", "application-gateway", "show", "-n", name, "-g", rg]) or agw
+            show = agw  # list already returns the full object — no separate show needed
             gw_subnet_raw = safe_get(show, "gatewayIPConfigurations", default=[{}])
             gw_subnet = parse_vnet_subnet(safe_get(gw_subnet_raw[0], "subnet", "id") or "") if gw_subnet_raw else {}
             agw_list.append({
@@ -920,7 +929,7 @@ class AzureInventoryCollector:
         waf_policies = []
         for pol in (self._az(["network", "application-gateway", "waf-policy", "list", "-g", rg]) or []):
             pname = pol.get("name", "")
-            show = self._az(["network", "application-gateway", "waf-policy", "show", "-n", pname, "-g", rg]) or pol
+            show = pol  # list already returns the full object — no separate show needed
             waf_policies.append({
                 "id": show.get("id"), "name": pname,
                 "location": show.get("location"), "resourceGroup": rg,
@@ -940,7 +949,7 @@ class AzureInventoryCollector:
         result = []
         for lb in lbs:
             name = lb.get("name", "")
-            show = self._az(["network", "lb", "show", "-n", name, "-g", rg]) or lb
+            show = lb  # list already returns the full object — no separate show needed
             result.append({
                 "id": show.get("id"), "name": name,
                 "location": show.get("location"), "resourceGroup": rg,
@@ -975,7 +984,7 @@ class AzureInventoryCollector:
         result = []
         for profile in profiles:
             name = profile.get("name", "")
-            show = self._az(["network", "traffic-manager", "profile", "show", "-n", name, "-g", rg]) or profile
+            show = profile  # list already returns the full object — no separate show needed
             result.append({
                 "id": show.get("id"), "name": name,
                 "resourceGroup": rg, "location": show.get("location"),
@@ -1005,11 +1014,16 @@ class AzureInventoryCollector:
         result = []
         for identity in ids:
             name = identity.get("name", "")
-            show = self._az(["identity", "show", "-n", name, "-g", rg]) or identity
+            show = identity  # list already returns the full object — no separate show needed
             pid = safe_get(show, "principalId")
-            try:
-                ra = self._az(["role", "assignment", "list", "--assignee", pid, "--all-namespaces"]) or [] if pid else []
-            except Exception:
+            # NOTE: role assignment lookup ("--all-namespaces") can take 10-30 s per identity
+            # on large subscriptions and is skipped for performance. Re-enable when needed.
+            if getattr(self.args, "collect_identity_roles", False) and pid:
+                try:
+                    ra = self._az(["role", "assignment", "list", "--assignee", pid, "--all-namespaces"]) or []
+                except Exception:
+                    ra = []
+            else:
                 ra = []
             result.append({
                 "id": show.get("id"), "name": name,
@@ -1030,7 +1044,7 @@ class AzureInventoryCollector:
             result = []
             for ws in (self._az(["monitor", "log-analytics", "workspace", "list", "-g", rg]) or []):
                 name = ws.get("name", "")
-                show = self._az(["monitor", "log-analytics", "workspace", "show", "-n", name, "-g", rg]) or ws
+                show = ws  # list already returns the full object — no separate show needed
                 result.append({
                     "id": show.get("id"), "name": name,
                     "location": show.get("location"), "resourceGroup": rg,
@@ -1047,7 +1061,7 @@ class AzureInventoryCollector:
             result = []
             for ai in (self._az(["monitor", "app-insights", "component", "list", "-g", rg]) or []):
                 name = ai.get("name", "")
-                show = self._az(["monitor", "app-insights", "component", "show", "-n", name, "-g", rg]) or ai
+                show = ai  # list already returns the full object — no separate show needed
                 result.append({
                     "id": show.get("id"), "name": name,
                     "location": show.get("location"), "resourceGroup": rg,
@@ -1089,7 +1103,7 @@ class AzureInventoryCollector:
             result = []
             for ag in ags:
                 name = ag.get("name", "")
-                show = self._az(["monitor", "action-group", "show", "-n", name, "-g", rg]) or ag
+                show = ag  # list already returns the full object — no separate show needed
                 result.append({
                     "id": show.get("id"), "name": name,
                     "location": show.get("location"), "resourceGroup": rg,
@@ -1112,7 +1126,7 @@ class AzureInventoryCollector:
             result = []
             for a in alerts:
                 name = a.get("name", "")
-                show = self._az(["monitor", "activity-log", "alert", "show", "-n", name, "-g", rg]) or a
+                show = a  # list already returns the full object — no separate show needed
                 result.append({
                     "id": show.get("id"), "name": name,
                     "location": show.get("location"), "resourceGroup": rg,
@@ -1137,7 +1151,7 @@ class AzureInventoryCollector:
             result = []
             for r in rules:
                 name = r.get("name", "")
-                show = self._az(["monitor", "scheduled-query", "show", "-n", name, "-g", rg]) or r
+                show = r  # list already returns the full object — no separate show needed
                 result.append({
                     "id": show.get("id"), "name": name,
                     "location": show.get("location"), "resourceGroup": rg,
@@ -1158,17 +1172,25 @@ class AzureInventoryCollector:
             return {"scheduled_query_alerts": result}
 
         def _smart_detector_alerts():
-            # Smart Detector Alert Rules live under microsoft.alertsmanagement/smartDetectorAlertRules
+            # Smart Detector Alert Rules — uses the REST API directly because
+            # az monitor has no dedicated subcommand for this resource type.
+            _sub = getattr(self, "_active_sub_id", None) or self._sub_id or ""
+            if not _sub:
+                return {"smart_detector_alert_rules": []}
             alerts = self._az([
                 "rest", "--method", "get",
-                "--url", f"https://management.azure.com/subscriptions/{{sub}}/resourceGroups/{rg}"
-                         f"/providers/microsoft.alertsmanagement/smartDetectorAlertRules"
-                         f"?api-version=2021-04-01",
+                "--url",
+                f"https://management.azure.com/subscriptions/{_sub}/resourceGroups/{rg}"
+                f"/providers/microsoft.alertsmanagement/smartDetectorAlertRules"
+                f"?api-version=2021-04-01",
             ]) or {}
             items = alerts.get("value", []) if isinstance(alerts, dict) else []
             result = []
             for a in items:
                 props = a.get("properties", {})
+                # actionGroups.groupIds is a list of ARM resource-ID strings,
+                # NOT a list of dicts — return them directly.
+                group_ids = list(safe_get(props, "actionGroups", "groupIds") or [])
                 result.append({
                     "id": a.get("id"), "name": a.get("name"),
                     "location": a.get("location"), "resourceGroup": rg,
@@ -1179,10 +1201,7 @@ class AzureInventoryCollector:
                     "frequency": props.get("frequency"),
                     "scope": props.get("scope", []),
                     "detector_id": safe_get(props, "detector", "id"),
-                    "action_group_ids": [
-                        ag.get("actionGroupId")
-                        for ag in (safe_get(props, "actionGroups", "groupIds") or [])
-                    ],
+                    "action_group_ids": group_ids,
                     "alert_type": "smart_detector",
                 })
             return {"smart_detector_alert_rules": result}
@@ -1206,12 +1225,12 @@ class AzureInventoryCollector:
             result = []
             for t in topics:
                 name = t.get("name", "")
-                show = self._az(["eventgrid", "topic", "show", "-n", name, "-g", rg]) or t
+                show = t  # list already returns the full object — no separate show needed
                 # fetch event subscriptions for each topic
-                subs = self._az([
+                subs = (self._az([
                     "eventgrid", "event-subscription", "list",
                     "--source-resource-id", show.get("id", ""),
-                ]) or [] if show.get("id") else []
+                ]) or []) if show.get("id") else []
                 result.append({
                     "id": show.get("id"), "name": name,
                     "location": show.get("location"), "resourceGroup": rg,
@@ -1236,7 +1255,7 @@ class AzureInventoryCollector:
             result = []
             for d in domains:
                 name = d.get("name", "")
-                show = self._az(["eventgrid", "domain", "show", "-n", name, "-g", rg]) or d
+                show = d  # list already returns the full object — no separate show needed
                 dom_topics = self._az([
                     "eventgrid", "domain", "topic", "list", "-g", rg, "--domain-name", name,
                 ]) or []
@@ -1287,16 +1306,13 @@ class AzureInventoryCollector:
                   and not r.get("type", "").lower().startswith("microsoft.network/")]
         result = []
         for r in others:
-            try:
-                details = self._az(["resource", "show", "--ids", r["id"]])
-            except Exception:
-                details = None
+            # Use resource list data directly — avoids one "resource show --ids" call per resource
             result.append({
                 "id": r["id"], "name": r["name"], "type": r["type"],
                 "location": r["location"], "resourceGroup": rg,
                 "tags": r.get("tags") or {},
-                "sku": safe_get(details, "sku"),
-                "kind": safe_get(details, "kind"),
+                "sku": r.get("sku"),
+                "kind": r.get("kind"),
                 "note": "Full config in raw-data JSON",
             })
         return {"other_resources": result}
@@ -2035,7 +2051,7 @@ function _doGlobalSearch(val){
   if(!v && !_activeTeam && !_activeSvcTeam){
     // restore everything
     document.querySelectorAll('table tbody tr').forEach(function(tr){tr.style.display='';});
-    document.querySelectorAll('details').forEach(function(d){d.style.display='';d.open=false;});
+    document.querySelectorAll('details').forEach(function(d){d.style.display='';d.open=true;});
     document.querySelectorAll('.card').forEach(function(el){el.style.display='';});
     document.querySelectorAll('.rg-header').forEach(function(el){el.style.display='';});
     if(countEl) countEl.textContent='';
@@ -2065,15 +2081,24 @@ function _doGlobalSearch(val){
     card.style.display=match?'':'none';
     if(match) found++;
   });
-  // Show/hide rg-header along with its following sibling cards
+  // Show/hide rg-header AND all its following sibling cards/details as a group
   document.querySelectorAll('.rg-header').forEach(function(hdr){
     var el=hdr.nextElementSibling;
-    var anyVisible=false;
+    var hasDets=false,anyDetVisible=false;
     while(el && !el.classList.contains('rg-header')){
-      if(el.style.display!=='none') anyVisible=true;
+      if(el.tagName==='DETAILS'){hasDets=true;if(el.style.display!=='none')anyDetVisible=true;}
       el=el.nextElementSibling;
     }
-    hdr.style.display=anyVisible?'':'none';
+    // Show if: empty RG (no <details> siblings at all) or at least one <details> is visible
+    var groupVisible=(!hasDets||anyDetVisible);
+    hdr.style.display=groupVisible?'':'none';
+    // Also hide/show non-details siblings (e.g. the RG-level tags card) with the group
+    el=hdr.nextElementSibling;
+    while(el && !el.classList.contains('rg-header')){
+      var nx=el.nextElementSibling;
+      if(el.tagName!=='DETAILS') el.style.display=groupVisible?'':'none';
+      el=nx;
+    }
   });
   if(countEl) countEl.textContent=found+' match'+(found===1?'':'es');
 }
@@ -2234,7 +2259,7 @@ document.addEventListener('DOMContentLoaded',function(){
                 team_badge = (f' <span style="font-size:10px;background:{team_color};color:white;'
                               f'padding:1px 7px;border-radius:10px;font-weight:normal;vertical-align:middle">'
                               f'{team_label}</span>') if team_label else ''
-                parts.append(f'<details{team_attr}><summary>{label} ({len(res_list)}){team_badge}</summary><div class="card">')
+                parts.append(f'<details open{team_attr}><summary>{label} ({len(res_list)}){team_badge}</summary><div class="card">')
                 parts.append('<table><thead><tr><th>Name</th><th>Location</th><th>Tags</th><th>Service Team</th><th>Details</th><th>Migration Notes</th></tr></thead><tbody>')
                 for res in res_list:
                     name = self._esc(res.get("name",""))
@@ -2723,6 +2748,7 @@ class GitRepoScanner:
         self._findings  = []
         self._repo_meta = []
         self._counter   = 0
+        self._counter_lock = threading.Lock()
 
     # ── public entry point ────────────────────────────────────────────────────
     def scan_all(self):
@@ -2952,9 +2978,11 @@ class GitRepoScanner:
                     # sanitize raw match: never store actual keys/passwords
                     raw = self._sanitize(m.group(0), ptype, is_secret)
 
-                    self._counter += 1
+                    with self._counter_lock:
+                        self._counter += 1
+                        fid = self._counter
                     finding = {
-                        "finding_id":            f"GIT-{self._counter:04d}",
+                        "finding_id":            f"GIT-{fid:04d}",
                         "repo_name":             repo_name,
                         "project":               project,
                         "file_path":             rel_path,
@@ -4046,6 +4074,7 @@ def parse_args():
         "collect_monitoring":         True,
         "collect_event_grid":          True,
         "collect_other_resources":    False,
+        "collect_identity_roles":     False,  # slow subscription-wide RBAC scan per identity
         "https_proxy":                "",
         "no_proxy":                   "",
         "az_path":                    "",

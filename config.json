@@ -5,7 +5,7 @@
     "output_dir": "./migration-output",
 
     "_comment_parallel": "parallel_workers: number of threads used for concurrent resource-type discovery within a subscription (networking / VMs / App Services / SQL / Storage / PaaS all run in parallel). Increase for faster runs on large environments (12-20 recommended). git_clone_workers: parallel threads for cloning + scanning git repos.",
-    "parallel_workers": 10,
+    "parallel_workers": 20,
     "git_clone_workers": 5,
 
     "skip_html": false,
@@ -25,7 +25,11 @@
     "collect_traffic_managers": true,
     "collect_managed_identities": true,
     "collect_monitoring": true,
+    "collect_event_grid": true,
     "collect_other_resources": false,
+
+    "_comment_identity_roles": "collect_identity_roles: when true, queries all RBAC role assignments for every managed identity (az role assignment list --assignee <pid> --all-namespaces). This is a subscription-wide query that can take 10-30 s per identity on large subscriptions. Set to false for faster scans; assignments can be reviewed manually post-migration.",
+    "collect_identity_roles": false,
 
     "_comment_read_only": "read_only_enforce: when true, a custom HTTP policy is attached to every Azure SDK client that raises RuntimeError if any non-GET HTTP method is attempted. This makes accidental write operations impossible. Recommended: true.",
     "read_only_enforce": true,
