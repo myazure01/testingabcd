@@ -316,6 +316,43 @@ class AzureInventoryCollector:
         # Detector alerts) can embed it without a separate API call.
         self._active_sub_id = sub.get("id") or self._sub_id or ""
 
+        # ── Diagnostic: log what each init query returned ────────────────────
+        self.tracker.log_info(
+            f"Init queries: group list={len(all_rgs)} RGs, "
+            f"resource list={len(flat)} resources"
+        )
+
+        # ── Fallback: az group list returned nothing but resource list has RG
+        # names (common on CSP subscriptions or restricted RBAC roles where
+        # 'Microsoft.Resources/subscriptions/resourceGroups/read' is missing
+        # at the subscription level but resources are still readable per-RG).
+        if not all_rgs and flat:
+            self.tracker.log_warning(
+                "az group list returned 0 results — rebuilding RG list from "
+                "az resource list (CSP / restricted-RBAC fallback)."
+            )
+            seen_rg_names = {}
+            for rg_name in flat:
+                if rg_name and rg_name.lower() not in seen_rg_names:
+                    seen_rg_names[rg_name.lower()] = rg_name
+            # Build minimal RG dicts — location unknown at this point; collectors
+            # will still work because they receive the RG name, not the location.
+            all_rgs = [{"name": n, "location": "", "tags": {}}
+                       for n in seen_rg_names.values()]
+            self.tracker.log_info(
+                f"Reconstructed {len(all_rgs)} RG(s) from resource list."
+            )
+
+        # If both queries returned nothing, try a direct group list without
+        # --subscription (safety net for accounts where the param is restricted).
+        if not all_rgs and not flat:
+            self.tracker.log_warning(
+                "Both group list and resource list returned empty — retrying "
+                "group list without explicit --subscription flag."
+            )
+            all_rgs = run_az(["group", "list"]) or []
+            self.tracker.log_info(f"Retry group list={len(all_rgs)} RGs")
+
         # Build rg_counts with lowercase keys — Azure RG names are case-insensitive
         # but az resource list and az group list may return them in different casing.
         rg_counts = {}
