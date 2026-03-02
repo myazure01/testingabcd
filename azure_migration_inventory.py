@@ -322,36 +322,74 @@ class AzureInventoryCollector:
             f"resource list={len(flat)} resources"
         )
 
+        # ── CSP / restricted-RBAC fallback ───────────────────────────────────
+        # On CSP subscriptions, 'az group list --subscription <id>' and
+        # 'az resource list --subscription <id>' silently return [] because the
+        # account lacks subscription-level read but still has resource-group-level
+        # access.  Strategy: retry all init queries WITHOUT --subscription so az
+        # CLI uses its current active-subscription context instead.
+        if not all_rgs and not flat and self._sub_id:
+            self.tracker.log_warning(
+                "Both init queries returned empty with --subscription flag "
+                "(CSP / restricted-RBAC account detected) — retrying WITHOUT "
+                "--subscription (using active az CLI context)."
+            )
+            with ThreadPoolExecutor(max_workers=3) as _retry_pool:
+                _r_rgs  = _retry_pool.submit(run_az, ["group", "list"])
+                _r_flat = _retry_pool.submit(run_az, ["resource", "list",
+                                                      "--query", "[].resourceGroup"])
+                # Also fetch full resource list for location data
+                _r_full = _retry_pool.submit(run_az, ["resource", "list"])
+            all_rgs   = _r_rgs.result()  or []
+            flat      = _r_flat.result() or []
+            full_res  = _r_full.result() or []
+            self.tracker.log_info(
+                f"Retry (no --subscription): group list={len(all_rgs)} RGs, "
+                f"resource list={len(flat)} resources"
+            )
+            # If group list still empty but we have full resource data, build
+            # RG list with locations from the full resource list
+            if not all_rgs and full_res:
+                rg_map = {}   # lower_name -> {name, location}
+                for r in full_res:
+                    rg_name = r.get("resourceGroup") or r.get("id", "").split("/resourceGroups/")[1].split("/")[0] if "/resourceGroups/" in r.get("id", "") else ""
+                    if rg_name and rg_name.lower() not in rg_map:
+                        rg_map[rg_name.lower()] = {
+                            "name": rg_name,
+                            "location": r.get("location", ""),
+                            "tags": {}
+                        }
+                if rg_map:
+                    all_rgs = list(rg_map.values())
+                    self.tracker.log_info(
+                        f"Reconstructed {len(all_rgs)} RG(s) with locations from full resource list."
+                    )
+            # On CSP: also disable per-RG --subscription scoping for collectors
+            # since that's what caused the empty results
+            if all_rgs:
+                self.tracker.log_warning(
+                    "CSP mode: disabling --subscription flag for all resource "
+                    "collectors — using active az CLI context instead."
+                )
+                self._az = run_az   # use unscoped az calls for all collectors
+                self._sub_id = ""   # prevent --subscription being re-injected
+
         # ── Fallback: az group list returned nothing but resource list has RG
-        # names (common on CSP subscriptions or restricted RBAC roles where
-        # 'Microsoft.Resources/subscriptions/resourceGroups/read' is missing
-        # at the subscription level but resources are still readable per-RG).
+        # names (handles partial-permission accounts)
         if not all_rgs and flat:
             self.tracker.log_warning(
                 "az group list returned 0 results — rebuilding RG list from "
-                "az resource list (CSP / restricted-RBAC fallback)."
+                "az resource list."
             )
             seen_rg_names = {}
             for rg_name in flat:
                 if rg_name and rg_name.lower() not in seen_rg_names:
                     seen_rg_names[rg_name.lower()] = rg_name
-            # Build minimal RG dicts — location unknown at this point; collectors
-            # will still work because they receive the RG name, not the location.
             all_rgs = [{"name": n, "location": "", "tags": {}}
                        for n in seen_rg_names.values()]
             self.tracker.log_info(
                 f"Reconstructed {len(all_rgs)} RG(s) from resource list."
             )
-
-        # If both queries returned nothing, try a direct group list without
-        # --subscription (safety net for accounts where the param is restricted).
-        if not all_rgs and not flat:
-            self.tracker.log_warning(
-                "Both group list and resource list returned empty — retrying "
-                "group list without explicit --subscription flag."
-            )
-            all_rgs = run_az(["group", "list"]) or []
-            self.tracker.log_info(f"Retry group list={len(all_rgs)} RGs")
 
         # Build rg_counts with lowercase keys — Azure RG names are case-insensitive
         # but az resource list and az group list may return them in different casing.
