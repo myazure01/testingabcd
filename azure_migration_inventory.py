@@ -3223,19 +3223,29 @@ def resolve_subscriptions(args, tracker):
     names_lower   = [n.lower() for n in sub_names_cfg]
 
     if not sub_ids_cfg and not sub_names_cfg:
-        print("")
-        print("  " + "!" * 70)
-        print("  !! ERROR: No subscriptions mentioned in config.json.")
-        print("  !!")
-        print("  !! The script requires at least one of these fields in config.json:")
-        print("  !!   \"subscription_ids\":   [\"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\"]")
-        print("  !!   \"subscription_names\": [\"My Production Subscription\"]")
-        print("  !!")
-        print("  !! Names are case-insensitive and support partial matching.")
-        print("  !! Or pass --subscription-id <GUID> on the command line.")
-        print("  " + "!" * 70)
-        print("")
-        sys.exit(1)
+        # No subscription filter configured — default to the currently active
+        # subscription from 'az account show' (the one the user logged in to).
+        active = run_az(["account", "show"]) or {}
+        active_id   = (active.get("id") or active.get("subscriptionId", "")).strip()
+        active_name = active.get("name", "")
+        if not active_id:
+            print("")
+            print("  " + "!" * 70)
+            print("  !! ERROR: No subscriptions configured in config.json and")
+            print("  !!        'az account show' returned no active subscription.")
+            print("  !!")
+            print("  !! Either log in with:  az login")
+            print("  !! Or set in config.json:")
+            print("  !!   \"subscription_ids\":   [\"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\"]")
+            print("  !!   \"subscription_names\": [\"My Production Subscription\"]")
+            print("  " + "!" * 70)
+            print("")
+            sys.exit(1)
+        tracker.log_info(
+            f"No subscription filter in config.json — using active subscription: "
+            f"{active_name} ({active_id})"
+        )
+        return [{"id": active_id, "name": active_name}]
 
     all_subs = run_az(["account", "list"]) or []
     if not all_subs:
