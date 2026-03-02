@@ -316,10 +316,17 @@ class AzureInventoryCollector:
         # Detector alerts) can embed it without a separate API call.
         self._active_sub_id = sub.get("id") or self._sub_id or ""
 
+        # Build rg_counts with lowercase keys — Azure RG names are case-insensitive
+        # but az resource list and az group list may return them in different casing.
         rg_counts = {}
         for rg in flat:
             if rg:
-                rg_counts[rg] = rg_counts.get(rg, 0) + 1
+                key = rg.lower()
+                rg_counts[key] = rg_counts.get(key, 0) + 1
+
+        # Helper: look up count by RG name, case-insensitively
+        def _rg_count(name):
+            return rg_counts.get(name.lower(), 0)
 
         # Safety fallback: if the flat resource-list query returned nothing but
         # resource groups exist, the query may have failed (permissions, az CLI
@@ -339,8 +346,8 @@ class AzureInventoryCollector:
         self.tracker.print_summary_table(
             ["Resource Group", "Location", "Resources", "Status"],
             [[rg.get("name"), rg.get("location"),
-              rg_counts.get(rg.get("name", ""), "?") if _counts_reliable else "?",
-              ("EMPTY" if rg_counts.get(rg.get("name", ""), 0) == 0 else "collecting")
+              _rg_count(rg.get("name", "")) if _counts_reliable else "?",
+              ("EMPTY" if _rg_count(rg.get("name", "")) == 0 else "collecting")
                if _counts_reliable else "collecting"]
              for rg in all_rgs]
         )
@@ -352,8 +359,8 @@ class AzureInventoryCollector:
         }
 
         if _counts_reliable:
-            empty_rgs     = [rg for rg in all_rgs if rg_counts.get(rg["name"], 0) == 0]
-            non_empty_rgs = [rg for rg in all_rgs if rg_counts.get(rg["name"], 0) > 0]
+            empty_rgs     = [rg for rg in all_rgs if _rg_count(rg["name"]) == 0]
+            non_empty_rgs = [rg for rg in all_rgs if _rg_count(rg["name"]) > 0]
         else:
             # Flat query failed — run collectors on every RG; empty ones will
             # produce empty resource lists and be marked is_empty=True afterwards.
